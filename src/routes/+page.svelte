@@ -394,6 +394,7 @@
 		background-color: var(--glass-bg);
 		color: #fff;
 		padding: 0.75rem;
+		padding-bottom: 4rem;
 		overflow: auto;
 		backdrop-filter: blur(8px);
 		border: 1px solid var(--glass-border);
@@ -403,6 +404,14 @@
 		font-weight: 700;
 		margin-bottom: 0.5rem;
 		margin-right: 0.5rem;
+	}
+
+	/* Only the panel headers in main content (Folders / Files). */
+	.folder-div > .section-title,
+	.file-div > .section-title {
+		font-size: 1.05rem;
+		margin: 0.35rem 0 0.8rem 0.3rem;
+		letter-spacing: 0.01em;
 	}
 
 	.folder-grid {
