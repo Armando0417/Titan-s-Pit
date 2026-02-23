@@ -1,0 +1,14 @@
+{
+	"runId": "sync-2026-02-15-1740",
+	"source": "dropzone-alpha",
+	"target": "vault-main",
+	"filesScanned": 412,
+	"filesTransferred": 408,
+	"filesSkipped": 4,
+	"warnings": [
+		"2 files retried due to transient network timeout",
+		"metadata mismatch auto-corrected for 1 folder"
+	],
+	"durationSeconds": 186,
+	"status": "ok"
+}

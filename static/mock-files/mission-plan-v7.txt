@@ -1,0 +1,16 @@
+TITAN'S PIT MISSION PLAN V7
+Prepared: February 17, 2026
+
+Objective:
+- Stage assets for synchronized uplink test.
+- Validate transport paths across all dropzones.
+
+Runbook:
+1. Warm up relay nodes (alpha, bravo, canyon).
+2. Verify checksum parity for archive bundle.
+3. Begin transfer in 3 waves with 45s spacing.
+4. Confirm post-transfer visibility from dashboard.
+
+Contingency:
+- If packet loss > 2%, hold wave 3 and retry wave 2.
+- If auth token expires, rotate using vault profile "ops-shift-b".

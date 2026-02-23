@@ -1,0 +1,7 @@
+[2026-02-13 09:10:14] INFO  bootstrap complete
+[2026-02-13 09:10:17] INFO  loaded config profile: pit-default
+[2026-02-13 09:10:24] WARN  cache threshold nearing limit (84%)
+[2026-02-13 09:10:28] INFO  queue flush initiated
+[2026-02-13 09:10:33] INFO  queue flush completed
+[2026-02-13 09:10:45] INFO  upload listeners active
+[2026-02-13 09:11:02] INFO  health-check heartbeat stable

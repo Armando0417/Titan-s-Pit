@@ -1,0 +1,6 @@
+id,callsign,role,status,timezone
+01,Atlas,Coordinator,active,UTC-06
+02,Kite,Designer,active,UTC-05
+03,Rook,Data Ops,active,UTC-08
+04,Nyx,Validation,standby,UTC-07
+05,Vega,Infra,active,UTC-06
