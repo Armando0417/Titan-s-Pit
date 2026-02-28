@@ -13,8 +13,10 @@
 	export let file: ViewerFile | null = null;
 	export let playHoverSfx: (() => void) | null = null;
 	export let playMenuItemSfx: (() => void) | null = null;
+	export let canGoPrevious = false;
+	export let canGoNext = false;
 
-	const dispatch = createEventDispatcher<{ close: void }>();
+	const dispatch = createEventDispatcher<{ close: void; previous: void; next: void }>();
 
 	const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'bmp']);
 	const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'mov', 'm4v', 'avi', 'ogv', 'ogg']);
@@ -44,12 +46,38 @@
 		closeViewer();
 	}
 
+	function onPreviousButtonClick() {
+		if (!canGoPrevious) {
+			return;
+		}
+		onModalMenuAction();
+		dispatch('previous');
+	}
+
+	function onNextButtonClick() {
+		if (!canGoNext) {
+			return;
+		}
+		onModalMenuAction();
+		dispatch('next');
+	}
+
 	function onWindowKeydown(event: KeyboardEvent) {
 		if (!open) {
 			return;
 		}
 		if (event.key === 'Escape') {
 			closeViewer();
+			return;
+		}
+		if (event.key === 'ArrowLeft') {
+			event.preventDefault();
+			onPreviousButtonClick();
+			return;
+		}
+		if (event.key === 'ArrowRight') {
+			event.preventDefault();
+			onNextButtonClick();
 		}
 	}
 
@@ -87,6 +115,28 @@
 		<button class="backdrop" type="button" aria-label="Close preview" on:click={closeViewer}></button>
 
 		<div class="viewer">
+			<button
+				class="nav-arrow nav-arrow-left"
+				type="button"
+				aria-label="Previous file"
+				disabled={!canGoPrevious}
+				on:pointerenter={onModalButtonHover}
+				on:focus={onModalButtonHover}
+				on:click={onPreviousButtonClick}
+			>
+				&#8249;
+			</button>
+			<button
+				class="nav-arrow nav-arrow-right"
+				type="button"
+				aria-label="Next file"
+				disabled={!canGoNext}
+				on:pointerenter={onModalButtonHover}
+				on:focus={onModalButtonHover}
+				on:click={onNextButtonClick}
+			>
+				&#8250;
+			</button>
 			<div class="viewer-header">
 				<div class="file-name" title={file.name}>{file.name}</div>
 				<div class="viewer-actions">
@@ -200,6 +250,48 @@
 		padding: 0.65rem 0.8rem;
 		background: rgba(20, 20, 20, 0.94);
 		border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+	}
+
+	.nav-arrow {
+		position: absolute;
+		top: 50%;
+		z-index: 3;
+		width: 30px;
+		height: 30px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border: 1px solid rgba(255, 255, 255, 0.32);
+		border-radius: 999px;
+		background: rgba(10, 10, 10, 0.72);
+		color: rgba(245, 248, 252, 0.94);
+		font-size: 1.2rem;
+		line-height: 1;
+		cursor: pointer;
+		transform: translateY(-50%);
+	}
+
+	.nav-arrow:hover:not(:disabled) {
+		background: rgba(250, 238, 58, 0.22);
+		border-color: rgba(250, 238, 58, 0.72);
+	}
+
+	.nav-arrow:focus-visible {
+		outline: 1px solid rgba(250, 238, 58, 0.88);
+		outline-offset: 2px;
+	}
+
+	.nav-arrow:disabled {
+		opacity: 0.3;
+		cursor: default;
+	}
+
+	.nav-arrow-left {
+		left: 0.6rem;
+	}
+
+	.nav-arrow-right {
+		right: 0.6rem;
 	}
 
 	.file-name {

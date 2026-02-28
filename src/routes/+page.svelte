@@ -132,14 +132,26 @@
 	const HOVER_SFX_POOL_SIZE = 6;
 	const HOVER_SFX_MIN_INTERVAL_MS = 14;
 	const MAX_CONCURRENT_UPLOADS = 3;
+	const MOBILE_CONCURRENT_UPLOADS = 1;
+	const UPLOAD_ENQUEUE_BATCH_SIZE = 120;
+	const MAX_VISIBLE_TRANSFER_ITEMS = 180;
+	const MAX_FINISHED_TRANSFER_ITEMS = 260;
 	const TRANSFER_UI_REFRESH_INTERVAL_MS = 100;
 	const INVENTORY_DRAG_MIME = 'application/x-titanspit-inventory-paths';
 
 	let viewerOpen = false;
 	let activeFile: ActiveViewerFile | null = null;
+	let previewSelectedFileName: string | null = null;
+	let activeFileIndex = -1;
+	let canGoToPreviousFile = false;
+	let canGoToNextFile = false;
 	let sortKey: SortKey = data.sort.key;
 	let sortDirection: SortDirection = data.sort.direction;
 	let sortedFiles: InventoryFile[] = [];
+	let filteredSortedFiles: InventoryFile[] = [];
+	let inventorySearchQuery = '';
+	let normalizedInventorySearchQuery = '';
+	let filteredDirectories = data.inventory.directories;
 	let fileViewMode: 'list' | 'grid' = 'list';
 	let foldersPanelExpanded = false;
 	let activeSidebarTab: SidebarTab = data.initialTab;
@@ -160,9 +172,15 @@
 	let lastTransferItemsRefreshTs = 0;
 	const uploadQueue: TransferItem[] = [];
 	let activeUploads = 0;
+	let uploadConcurrencyLimit = MAX_CONCURRENT_UPLOADS;
 	let needsInventoryRefresh = false;
 	let forgeUploadsEnabled = false;
+	let forgePreparing = false;
+	let forgePreparationLabel = '';
+	let forgePreparationProgress = 0;
 	let activeTransferCount = 0;
+	let visibleTransferItems: TransferItem[] = [];
+	let hiddenTransferItemCount = 0;
 	let fileActionOpen = false;
 	let fileActionFile: InventoryFile | null = null;
 	let fileActionBusy = false;
@@ -186,6 +204,72 @@
 	let folderDeleteError = '';
 	const ensuredUploadPaths = new Set<string>(['/']);
 	const ensureUploadPathTasks = new Map<string, Promise<FileActionResponse>>();
+
+	function isLikelyMobileClient(): boolean {
+		if (!browser) {
+			return false;
+		}
+
+		const hasCoarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+		const ua = navigator.userAgent || '';
+		const isMobileUa = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+		return hasCoarsePointer || isMobileUa;
+	}
+
+	if (isLikelyMobileClient()) {
+		uploadConcurrencyLimit = MOBILE_CONCURRENT_UPLOADS;
+	}
+
+	function isTransferActive(status: TransferStatus): boolean {
+		return status === 'queued' || status === 'uploading';
+	}
+
+	function setForgePreparationState(label: string, progress = 0) {
+		forgePreparing = true;
+		forgePreparationLabel = label;
+		forgePreparationProgress = Math.max(0, Math.min(100, Math.round(progress)));
+	}
+
+	function clearForgePreparationState() {
+		forgePreparing = false;
+		forgePreparationLabel = '';
+		forgePreparationProgress = 0;
+	}
+
+	function pruneFinishedTransferHistory() {
+		let finishedCount = 0;
+		const nextReversed: TransferItem[] = [];
+		for (let index = transferItems.length - 1; index >= 0; index -= 1) {
+			const item = transferItems[index];
+			if (isTransferActive(item.status)) {
+				nextReversed.push(item);
+				continue;
+			}
+
+			if (finishedCount >= MAX_FINISHED_TRANSFER_ITEMS) {
+				continue;
+			}
+			finishedCount += 1;
+			nextReversed.push(item);
+		}
+
+		nextReversed.reverse();
+		const next = nextReversed;
+		if (next.length !== transferItems.length) {
+			transferItems = next;
+		}
+	}
+
+	function createUploadPrepLabel(verb: string, processed: number, total: number): string {
+		const safeTotal = Math.max(0, total);
+		return `${verb} ${Math.min(processed, safeTotal)} / ${safeTotal} files`;
+	}
+
+	async function yieldToMainThread() {
+		await new Promise<void>((resolve) => {
+			setTimeout(resolve, 0);
+		});
+	}
 
 	function flushTransferItemsRefresh() {
 		transferItemsRefreshPending = false;
@@ -298,6 +382,10 @@
 
 	function onFileRowClick(file: InventoryFile) {
 		playSfx('fileClick');
+		if (previewSelectedFileName !== file.name) {
+			previewSelectedFileName = file.name;
+			return;
+		}
 		openFileViewer(file);
 	}
 
@@ -435,6 +523,34 @@
 		return candidates;
 	}
 
+	function buildUploadCandidatesFromFileList(fileList: FileList | null): UploadCandidate[] {
+		const candidates: UploadCandidate[] = [];
+		if (!fileList) {
+			return candidates;
+		}
+
+		for (let i = 0; i < fileList.length; i += 1) {
+			const file = fileList.item(i);
+			if (!file || file.name.trim() === '') {
+				continue;
+			}
+
+			const relativePath = normalizeUploadRelativePath(
+				(file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+			);
+			if (!relativePath) {
+				continue;
+			}
+
+			candidates.push({
+				file,
+				relativePath
+			});
+		}
+
+		return candidates;
+	}
+
 	function dedupeUploadCandidates(candidates: UploadCandidate[]): UploadCandidate[] {
 		const seen = new Set<string>();
 		const deduped: UploadCandidate[] = [];
@@ -549,7 +665,7 @@
 			return dedupeUploadCandidates(candidates);
 		}
 
-		return buildUploadCandidatesFromFiles(transfer.files ? Array.from(transfer.files) : []);
+		return buildUploadCandidatesFromFileList(transfer.files ?? null);
 	}
 
 	function getUploadUrlForDestinationPath(destinationPath: string): string {
@@ -1202,7 +1318,7 @@
 		const candidates = pendingUploadFiles;
 		const destinationPath = pendingUploadDestinationPath || data.inventory.currentPath;
 		closeUploadConflictDialog();
-		enqueueUploads(candidates, strategy, destinationPath);
+		void enqueueUploads(candidates, strategy, destinationPath);
 	}
 
 	function toggleUploadDrawer() {
@@ -1211,7 +1327,7 @@
 	}
 
 	function openForgePicker() {
-		if (!forgeUploadsEnabled) {
+		if (!forgeUploadsEnabled || forgePreparing) {
 			return;
 		}
 
@@ -1220,7 +1336,7 @@
 	}
 
 	function openForgeFolderPicker() {
-		if (!forgeUploadsEnabled) {
+		if (!forgeUploadsEnabled || forgePreparing) {
 			return;
 		}
 
@@ -1228,32 +1344,45 @@
 		forgeFolderInput?.click();
 	}
 
-	function onForgeFileInputChange(event: Event) {
+	async function onForgeFileInputChange(event: Event) {
 		const target = event.currentTarget;
 		if (!(target instanceof HTMLInputElement)) {
 			return;
 		}
 
-		const candidates = buildUploadCandidatesFromFiles(target.files ? Array.from(target.files) : []);
-		queueFilesForUpload(candidates);
+		if (forgePreparing) {
+			target.value = '';
+			return;
+		}
+
+		setForgePreparationState('Reading selected files...', 8);
+		const candidates = buildUploadCandidatesFromFileList(target.files ?? null);
 		target.value = '';
+		await queueFilesForUpload(candidates);
 	}
 
-	function onForgeFolderInputChange(event: Event) {
+	async function onForgeFolderInputChange(event: Event) {
 		const target = event.currentTarget;
 		if (!(target instanceof HTMLInputElement)) {
 			return;
 		}
 
-		const candidates = buildUploadCandidatesFromFiles(target.files ? Array.from(target.files) : []);
+		if (forgePreparing) {
+			target.value = '';
+			return;
+		}
+
+		setForgePreparationState('Reading folder contents...', 5);
+		const candidates = buildUploadCandidatesFromFileList(target.files ?? null);
 		if (candidates.length === 0) {
+			clearForgePreparationState();
 			forgeDropError = 'Folder picker returned no files. Your mobile browser may not support folder selection.';
 			target.value = '';
 			return;
 		}
 
-		queueFilesForUpload(candidates);
 		target.value = '';
+		await queueFilesForUpload(candidates);
 	}
 
 	function enableDirectoryPicker(node: HTMLInputElement) {
@@ -1274,13 +1403,17 @@
 		return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 	}
 
-	function queueFilesForUpload(candidates: UploadCandidate[]) {
+	async function queueFilesForUpload(candidates: UploadCandidate[]) {
+		forgeDropError = '';
+
 		if (candidates.length === 0) {
+			clearForgePreparationState();
 			forgeDropError = 'No files detected.';
 			return;
 		}
 
 		if (!forgeUploadsEnabled) {
+			clearForgePreparationState();
 			forgeDropError = 'Forge upload target is unavailable.';
 			return;
 		}
@@ -1289,22 +1422,26 @@
 			(candidate) => candidate.file && candidate.file.name.trim() !== '' && candidate.relativePath.trim() !== ''
 		);
 		if (validCandidates.length === 0) {
+			clearForgePreparationState();
 			forgeDropError = 'No valid files detected.';
 			return;
 		}
 
 		const destinationPath = normalizeInventoryPath(data.inventory.currentPath);
+		setForgePreparationState('Checking file conflicts...', 20);
 		const conflicts = buildUploadConflicts(validCandidates);
 		if (conflicts.length > 0) {
+			clearForgePreparationState();
 			openUploadConflictDialog(conflicts, validCandidates, destinationPath);
 			return;
 		}
 
-		enqueueUploads(validCandidates, 'skip', destinationPath);
+		await enqueueUploads(validCandidates, 'skip', destinationPath);
 	}
 
-	function enqueueUploads(candidates: UploadCandidate[], strategy: ConflictStrategy, destinationPath: string) {
+	async function enqueueUploads(candidates: UploadCandidate[], strategy: ConflictStrategy, destinationPath: string) {
 		if (!forgeUploadsEnabled) {
+			clearForgePreparationState();
 			forgeDropError = 'Forge upload target is unavailable.';
 			return;
 		}
@@ -1314,7 +1451,8 @@
 			[normalizedDestinationPath, new Set(data.inventory.files.map((entry) => entry.name))]
 		]);
 		const reservedNamesByDestination = new Map<string, Set<string>>();
-		const items: TransferItem[] = [];
+		let enqueuedCount = 0;
+		let batchItems: TransferItem[] = [];
 
 		const getReservedNames = (path: string): Set<string> => {
 			const existing = reservedNamesByDestination.get(path);
@@ -1326,75 +1464,102 @@
 			return seededNames;
 		};
 
-		for (const candidate of candidates) {
-			const normalizedRelativePath = normalizeUploadRelativePath(candidate.relativePath);
-			const { directory, fileName } = splitUploadRelativePath(normalizedRelativePath);
-			const sourceName = fileName.trim();
-			if (!sourceName) {
-				continue;
-			}
+		setForgePreparationState(createUploadPrepLabel('Queueing', 0, candidates.length), 0);
 
-			const resolvedDestinationPath = directory
-				? joinNormalizedPaths(normalizedDestinationPath, directory)
-				: normalizedDestinationPath;
-			const reservedNames = getReservedNames(resolvedDestinationPath);
-			const existingNames = existingNamesByDestination.get(resolvedDestinationPath) ?? new Set<string>();
-			const hasConflict = reservedNames.has(sourceName);
-			const existsOnServer = existingNames.has(sourceName);
+		try {
+			for (let index = 0; index < candidates.length; index += 1) {
+				const candidate = candidates[index];
+				const normalizedRelativePath = normalizeUploadRelativePath(candidate.relativePath);
+				const { directory, fileName } = splitUploadRelativePath(normalizedRelativePath);
+				const sourceName = fileName.trim();
+				if (!sourceName) {
+					continue;
+				}
 
-			if (hasConflict && strategy === 'skip') {
-				continue;
-			}
+				const resolvedDestinationPath = directory
+					? joinNormalizedPaths(normalizedDestinationPath, directory)
+					: normalizedDestinationPath;
+				const reservedNames = getReservedNames(resolvedDestinationPath);
+				const existingNames = existingNamesByDestination.get(resolvedDestinationPath) ?? new Set<string>();
+				const hasConflict = reservedNames.has(sourceName);
+				const existsOnServer = existingNames.has(sourceName);
 
-			let targetName = sourceName;
-			let replaceExisting = false;
-			if (strategy === 'rename') {
-				targetName = makeUniqueFileName(sourceName, reservedNames);
-			} else if (strategy === 'replace') {
-				if (existsOnServer && resolvedDestinationPath === normalizedDestinationPath) {
-					replaceExisting = true;
-					reservedNames.add(targetName);
-				} else if (hasConflict) {
+				if (hasConflict && strategy === 'skip') {
+					continue;
+				}
+
+				let targetName = sourceName;
+				let replaceExisting = false;
+				if (strategy === 'rename') {
 					targetName = makeUniqueFileName(sourceName, reservedNames);
+				} else if (strategy === 'replace') {
+					if (existsOnServer && resolvedDestinationPath === normalizedDestinationPath) {
+						replaceExisting = true;
+						reservedNames.add(targetName);
+					} else if (hasConflict) {
+						targetName = makeUniqueFileName(sourceName, reservedNames);
+					} else {
+						reservedNames.add(targetName);
+					}
 				} else {
 					reservedNames.add(targetName);
 				}
-			} else {
-				reservedNames.add(targetName);
-			}
 
-			items.push({
-				id: createTransferId(),
-				file: candidate.file,
-				sourceName,
-				targetName,
-				targetPath: joinNormalizedPaths(resolvedDestinationPath, targetName),
-				destinationPath: resolvedDestinationPath,
-				uploadUrl: getUploadUrlForDestinationPath(resolvedDestinationPath),
-				name: normalizedRelativePath || targetName,
-				size: candidate.file.size,
-				loaded: 0,
-				progress: 0,
-				status: 'queued',
-				replaceExisting
-			});
+				batchItems.push({
+					id: createTransferId(),
+					file: candidate.file,
+					sourceName,
+					targetName,
+					targetPath: joinNormalizedPaths(resolvedDestinationPath, targetName),
+					destinationPath: resolvedDestinationPath,
+					uploadUrl: getUploadUrlForDestinationPath(resolvedDestinationPath),
+					name: normalizedRelativePath || targetName,
+					size: candidate.file.size,
+					loaded: 0,
+					progress: 0,
+					status: 'queued',
+					replaceExisting
+				});
+				enqueuedCount += 1;
+
+				const isBatchBoundary = (index + 1) % UPLOAD_ENQUEUE_BATCH_SIZE === 0 || index + 1 === candidates.length;
+				if (!isBatchBoundary) {
+					continue;
+				}
+
+				if (batchItems.length > 0) {
+					transferItems.push(...batchItems);
+					uploadQueue.push(...batchItems);
+					batchItems = [];
+					touchTransferItems(true);
+					processUploadQueue();
+				}
+
+				const processed = index + 1;
+				setForgePreparationState(
+					createUploadPrepLabel('Queueing', processed, candidates.length),
+					(processed / Math.max(candidates.length, 1)) * 100
+				);
+				pruneFinishedTransferHistory();
+				await yieldToMainThread();
+			}
+		} finally {
+			clearForgePreparationState();
 		}
 
-		if (items.length === 0) {
+		if (enqueuedCount === 0) {
 			forgeDropError = strategy === 'skip' ? 'All conflicting files were skipped.' : 'No files to upload.';
 			return;
 		}
 
 		forgeDropError = '';
 		uploadDrawerOpen = true;
-		transferItems = [...items, ...transferItems];
-		uploadQueue.push(...items);
 		playSfx('fileClick');
 		processUploadQueue();
 	}
 
 	function processUploadQueue() {
-		while (activeUploads < MAX_CONCURRENT_UPLOADS && uploadQueue.length > 0) {
+		while (activeUploads < uploadConcurrencyLimit && uploadQueue.length > 0) {
 			const next = uploadQueue.shift();
 			if (!next || next.status !== 'queued') {
 				continue;
@@ -1407,6 +1572,7 @@
 		item.xhr = undefined;
 		activeUploads = Math.max(0, activeUploads - 1);
 		processUploadQueue();
+		pruneFinishedTransferHistory();
 		touchTransferItems(true);
 
 		if (activeUploads === 0 && uploadQueue.length === 0 && needsInventoryRefresh) {
@@ -1549,13 +1715,11 @@
 	}
 
 	function clearFinishedTransfers() {
-		transferItems = transferItems.filter(
-			(item) => item.status === 'queued' || item.status === 'uploading'
-		);
+		transferItems = transferItems.filter((item) => isTransferActive(item.status));
 	}
 
 	function onForgeDragEnter(event: DragEvent) {
-		if (!forgeUploadsEnabled || !event.dataTransfer?.types.includes('Files')) {
+		if (!forgeUploadsEnabled || forgePreparing || !event.dataTransfer?.types.includes('Files')) {
 			return;
 		}
 		event.preventDefault();
@@ -1568,11 +1732,11 @@
 			return;
 		}
 		event.preventDefault();
-		event.dataTransfer.dropEffect = forgeUploadsEnabled ? 'copy' : 'none';
+		event.dataTransfer.dropEffect = forgeUploadsEnabled && !forgePreparing ? 'copy' : 'none';
 	}
 
 	function onForgeDragLeave(event: DragEvent) {
-		if (!forgeUploadsEnabled) {
+		if (!forgeUploadsEnabled || forgePreparing) {
 			return;
 		}
 		event.preventDefault();
@@ -1587,10 +1751,16 @@
 		forgeDragDepth = 0;
 		forgeDragActive = false;
 
+		if (!forgeUploadsEnabled || forgePreparing) {
+			return;
+		}
+
 		try {
+			setForgePreparationState('Scanning dropped folder contents...', 4);
 			const candidates = await extractDroppedUploadCandidates(event);
-			queueFilesForUpload(candidates);
+			await queueFilesForUpload(candidates);
 		} catch {
+			clearForgePreparationState();
 			forgeDropError = 'Unable to read dropped folder contents.';
 		}
 	}
@@ -1658,15 +1828,20 @@
 		return `?path=${encodeURIComponent(safePath)}&tab=${encodeURIComponent(activeSidebarTab)}`;
 	}
 
-	function openFileViewer(file: InventoryFile) {
-		playSfx('dialogOpen');
-		activeFile = {
+	function toActiveViewerFile(file: InventoryFile): ActiveViewerFile {
+		return {
 			name: file.name,
 			type: resolveFileType(file.name, file.extension),
 			sizeBytes: file.size,
 			modified: formatModified(file.modified, file.modifiedTs),
 			href: file.href
 		};
+	}
+
+	function openFileViewer(file: InventoryFile) {
+		playSfx('dialogOpen');
+		previewSelectedFileName = file.name;
+		activeFile = toActiveViewerFile(file);
 		viewerOpen = true;
 	}
 
@@ -1675,6 +1850,21 @@
 			playSfx('dialogClose');
 		}
 		viewerOpen = false;
+	}
+
+	function goToViewerSiblingFile(direction: -1 | 1) {
+		if (!activeFile || filteredSortedFiles.length === 0) {
+			return;
+		}
+
+		const targetIndex = activeFileIndex + direction;
+		if (targetIndex < 0 || targetIndex >= filteredSortedFiles.length) {
+			return;
+		}
+
+		const targetFile = filteredSortedFiles[targetIndex];
+		previewSelectedFileName = targetFile.name;
+		activeFile = toActiveViewerFile(targetFile);
 	}
 
 	function toggleSort(nextKey: SortKey) {
@@ -1757,6 +1947,21 @@
 		const direction = sortDirection;
 		sortedFiles = [...data.inventory.files].sort((a, b) => compareFiles(a, b, key, direction));
 	}
+	$: normalizedInventorySearchQuery = inventorySearchQuery.trim().toLowerCase();
+	$: filteredDirectories = normalizedInventorySearchQuery
+		? data.inventory.directories.filter((folder) =>
+				folder.name.toLowerCase().includes(normalizedInventorySearchQuery)
+			)
+		: data.inventory.directories;
+	$: filteredSortedFiles = normalizedInventorySearchQuery
+		? sortedFiles.filter((file) => {
+				const fileType = resolveFileType(file.name, file.extension).toLowerCase();
+				return (
+					file.name.toLowerCase().includes(normalizedInventorySearchQuery) ||
+					fileType.includes(normalizedInventorySearchQuery)
+				);
+			})
+		: sortedFiles;
 	$: {
 		if (selectedFileNames.size > 0) {
 			const availableNames = new Set(data.inventory.files.map((file) => file.name));
@@ -1774,6 +1979,26 @@
 			}
 		}
 	}
+	$: {
+		if (previewSelectedFileName) {
+			const hasPreviewSelection = data.inventory.files.some((file) => file.name === previewSelectedFileName);
+			if (!hasPreviewSelection) {
+				previewSelectedFileName = null;
+			}
+		}
+	}
+	$: {
+		const viewerFile = activeFile;
+		if (!viewerFile) {
+			activeFileIndex = -1;
+		} else {
+			activeFileIndex = filteredSortedFiles.findIndex(
+				(file) => file.name === viewerFile.name && file.href === viewerFile.href
+			);
+		}
+	}
+	$: canGoToPreviousFile = activeFileIndex > 0;
+	$: canGoToNextFile = activeFileIndex >= 0 && activeFileIndex < filteredSortedFiles.length - 1;
 	$: selectedFileCount = selectedFileNames.size;
 	$: allFilesSelected = data.inventory.files.length > 0 && selectedFileCount === data.inventory.files.length;
 	$: {
@@ -1792,9 +2017,9 @@
 		}
 	}
 	$: forgeUploadsEnabled = data.inventory.uploadUrl.trim() !== '';
-	$: activeTransferCount = transferItems.filter(
-		(item) => item.status === 'queued' || item.status === 'uploading'
-	).length;
+	$: activeTransferCount = activeUploads + uploadQueue.length;
+	$: visibleTransferItems = transferItems.slice(-MAX_VISIBLE_TRANSFER_ITEMS).reverse();
+	$: hiddenTransferItemCount = Math.max(0, transferItems.length - visibleTransferItems.length);
 
 </script>
 
@@ -1821,37 +2046,90 @@
 				{/if}
 			</div>
 
-			<div class="sidebar-tabs" role="tablist" aria-label="Main sections">
-				<button
-					type="button"
-					role="tab"
-					class="sidebar-tab-btn"
-					class:active={activeSidebarTab === 'inventions'}
-					aria-selected={activeSidebarTab === 'inventions'}
-					on:pointerenter={playHoverSfx}
-					on:focus={playHoverSfx}
-					on:click={() => setSidebarTab('inventions')}
-				>
-					Inventions
-				</button>
-				<button
-					type="button"
-					role="tab"
-					class="sidebar-tab-btn"
-					class:active={activeSidebarTab === 'forge'}
-					aria-selected={activeSidebarTab === 'forge'}
-					on:pointerenter={playHoverSfx}
-					on:focus={playHoverSfx}
-					on:click={() => setSidebarTab('forge')}
-				>
-					Forge
-				</button>
+			<div class="sidebar-tabs-wrap">
+				<div class="sidebar-tabs" role="tablist" aria-label="Main sections">
+					<button
+						type="button"
+						role="tab"
+						class="sidebar-tab-btn"
+						class:active={activeSidebarTab === 'inventions'}
+						aria-selected={activeSidebarTab === 'inventions'}
+						on:pointerenter={playHoverSfx}
+						on:focus={playHoverSfx}
+						on:click={() => setSidebarTab('inventions')}
+					>
+						Inventions
+					</button>
+					<button
+						type="button"
+						role="tab"
+						class="sidebar-tab-btn"
+						class:active={activeSidebarTab === 'forge'}
+						aria-selected={activeSidebarTab === 'forge'}
+						on:pointerenter={playHoverSfx}
+						on:focus={playHoverSfx}
+						on:click={() => setSidebarTab('forge')}
+					>
+						Forge
+					</button>
+				</div>
+				<div class="sidebar-search">
+					<label class="sidebar-search-label" for="inventory-sidebar-search">Search</label>
+					<input
+						id="inventory-sidebar-search"
+						class="sidebar-search-input"
+						type="search"
+						bind:value={inventorySearchQuery}
+						placeholder={activeSidebarTab === 'forge' ? 'Search folders...' : 'Search files or folders...'}
+						autocomplete="off"
+						spellcheck="false"
+						on:pointerenter={playHoverSfx}
+						on:focus={playHoverSfx}
+					/>
+				</div>
 			</div>
 
 			<div class="sidebar-bottom-panel">
 				{#if activeSidebarTab === 'inventions'}
 					<p class="brand-line">Sort and preview your inventory.</p>
-					<p class="brand-line">Click any file row to open the viewer.</p>
+					<p class="brand-line">Click once to select, click again to open preview.</p>
+					<div class="file-selection-tools sidebar-file-selection-tools">
+						<span class="file-selection-count">{selectedFileCount} selected</span>
+						<div class="sidebar-file-selection-actions">
+							<button
+								type="button"
+								class="file-selection-btn"
+								on:pointerenter={playHoverSfx}
+								on:focus={playHoverSfx}
+								on:click={toggleSelectAllFiles}
+								disabled={data.inventory.files.length === 0 || isInventoryBusy()}
+							>
+								{allFilesSelected ? 'Unselect all' : 'Select all'}
+							</button>
+							<button
+								type="button"
+								class="file-selection-btn"
+								on:pointerenter={playHoverSfx}
+								on:focus={playHoverSfx}
+								on:click={clearSelectedFiles}
+								disabled={selectedFileCount === 0 || isInventoryBusy()}
+							>
+								Clear
+							</button>
+							{#if selectedFileCount > 0}
+								<button
+									type="button"
+									class="file-selection-btn file-selection-btn--danger sidebar-delete-selected-btn"
+									on:pointerenter={playHoverSfx}
+									on:focus={playHoverSfx}
+									on:click={onDeleteSelectedFiles}
+									disabled={isInventoryBusy()}
+								>
+									{deleteFilesBusy ? 'Deleting...' : 'Delete all'}
+								</button>
+							{/if}
+						</div>
+					</div>
 				{:else}
 					<p class="brand-line">Forge uploads into the active path.</p>
 					<p class="brand-line">Target: {data.inventory.currentPath}</p>
@@ -1931,10 +2209,12 @@
 
 							{#if data.inventory.error}
 								<div class="empty-state">Folder listing unavailable.</div>
-							{:else if data.inventory.directories.length === 0 && !data.inventory.parentPath}
-								<div class="empty-state">No folders in this location.</div>
+							{:else if filteredDirectories.length === 0}
+								<div class="empty-state">
+									{normalizedInventorySearchQuery ? 'No folders match your search.' : 'No folders in this location.'}
+								</div>
 							{:else}
-								{#each data.inventory.directories as folder}
+								{#each filteredDirectories as folder}
 									<div
 										class="folder-item-shell"
 										class:drop-target={activeFolderDropPath === folder.nextPath}
@@ -2006,41 +2286,6 @@
 									on:click={() => (fileViewMode = 'grid')}
 								>Grid</button>
 							</div>
-							<div class="file-selection-tools">
-								<span class="file-selection-count">{selectedFileCount} selected</span>
-								<button
-									type="button"
-									class="file-selection-btn"
-									on:pointerenter={playHoverSfx}
-									on:focus={playHoverSfx}
-									on:click={toggleSelectAllFiles}
-									disabled={data.inventory.files.length === 0 || isInventoryBusy()}
-								>
-									{allFilesSelected ? 'Unselect all' : 'Select all'}
-								</button>
-								<button
-									type="button"
-									class="file-selection-btn"
-									on:pointerenter={playHoverSfx}
-									on:focus={playHoverSfx}
-									on:click={clearSelectedFiles}
-									disabled={selectedFileCount === 0 || isInventoryBusy()}
-								>
-									Clear
-								</button>
-								{#if selectedFileCount > 0}
-									<button
-										type="button"
-										class="file-selection-btn file-selection-btn--danger"
-										on:pointerenter={playHoverSfx}
-										on:focus={playHoverSfx}
-										on:click={onDeleteSelectedFiles}
-										disabled={isInventoryBusy()}
-									>
-										{deleteFilesBusy ? 'Deleting...' : 'Delete all'}
-									</button>
-								{/if}
-							</div>
 						</div>
 						{#if fileViewMode === 'list'}
 							<p class="file-move-hint">Drag file rows onto folder tiles to move. Select multiple first for bulk move.</p>
@@ -2082,15 +2327,17 @@
 								</div>
 								{#if data.inventory.error}
 									<div class="empty-state">File listing unavailable.</div>
-								{:else if data.inventory.files.length === 0}
-									<div class="empty-state">No files in this location.</div>
+								{:else if filteredSortedFiles.length === 0}
+									<div class="empty-state">
+										{normalizedInventorySearchQuery ? 'No files match your search.' : 'No files in this location.'}
+									</div>
 								{:else}
-									{#each sortedFiles as file}
+									{#each filteredSortedFiles as file}
 										{@const fileType = resolveFileType(file.name, file.extension)}
 										{@const badge = getFileBadge(fileType)}
 										<div
 											class="file-grid file-row file-row-btn"
-											class:selected={selectedFileNames.has(file.name)}
+											class:selected={selectedFileNames.has(file.name) || previewSelectedFileName === file.name}
 											class:dragging={isFileBeingDragged(file)}
 											role="button"
 											tabindex="0"
@@ -2101,7 +2348,7 @@
 											on:keydown={(event) => onFileRowKeydown(event, file)}
 											on:dragstart={(event) => onFileDragStart(event, file)}
 											on:dragend={onFileDragEnd}
-											aria-label={`Open ${file.name}`}
+											aria-label={`Select or open ${file.name}`}
 										>
 											<span class="file-select-cell">
 												<input
@@ -2138,21 +2385,23 @@
 						{:else}
 							{#if data.inventory.error}
 								<div class="empty-state">File listing unavailable.</div>
-							{:else if data.inventory.files.length === 0}
-								<div class="empty-state">No files in this location.</div>
+							{:else if filteredSortedFiles.length === 0}
+								<div class="empty-state">
+									{normalizedInventorySearchQuery ? 'No files match your search.' : 'No files in this location.'}
+								</div>
 							{:else}
 								<div class="file-thumb-grid">
-									{#each sortedFiles as file}
+									{#each filteredSortedFiles as file}
 										{@const fileType = resolveFileType(file.name, file.extension)}
 										{@const badge = getFileBadge(fileType)}
 										<button
 											type="button"
 											class="file-thumb-card"
-											class:selected={selectedFileNames.has(file.name)}
+											class:selected={selectedFileNames.has(file.name) || previewSelectedFileName === file.name}
 											on:pointerenter={playHoverSfx}
 											on:focus={playHoverSfx}
-										on:click={() => onFileRowClick(file)}
-											aria-label={`Open ${file.name}`}
+											on:click={() => onFileRowClick(file)}
+											aria-label={`Select or open ${file.name}`}
 										>
 											<div class="file-thumb-card-preview">
 												{#if IMAGE_TYPES.has(fileType)}
@@ -2176,7 +2425,7 @@
 						<div
 							class="forge-drop-area"
 							class:active={forgeDragActive}
-							class:disabled={!forgeUploadsEnabled}
+							class:disabled={!forgeUploadsEnabled || forgePreparing}
 							role="region"
 							aria-label="Drop files to upload"
 							on:dragenter={onForgeDragEnter}
@@ -2189,6 +2438,7 @@
 								type="file"
 								multiple
 								class="forge-file-input"
+								disabled={!forgeUploadsEnabled || forgePreparing}
 								on:change={onForgeFileInputChange}
 							/>
 							<input
@@ -2196,16 +2446,23 @@
 								type="file"
 								multiple
 								class="forge-file-input"
+								disabled={!forgeUploadsEnabled || forgePreparing}
 								use:enableDirectoryPicker
 								on:change={onForgeFolderInputChange}
 							/>
 							<p class="forge-drop-title">
-								{forgeUploadsEnabled ? 'Drop files or folders to forge' : 'Forge is offline'}
+								{!forgeUploadsEnabled
+									? 'Forge is offline'
+									: forgePreparing
+										? 'Preparing uploads...'
+										: 'Drop files or folders to forge'}
 							</p>
 							<p class="forge-drop-copy">
-								{forgeUploadsEnabled
-									? 'Browse folders below, then drop files/folders here or use File Grabber.'
-									: 'Upload target is unavailable. Check Copyparty config.'}
+								{!forgeUploadsEnabled
+									? 'Upload target is unavailable. Check Copyparty config.'
+									: forgePreparing
+										? forgePreparationLabel
+										: 'Browse folders below, then drop files/folders here or use File Grabber.'}
 							</p>
 							<div class="forge-folder-nav">
 								<p class="forge-target-path">Target path: {formatPathLabel(data.inventory.currentPath)}</p>
@@ -2245,10 +2502,12 @@
 
 									{#if data.inventory.error}
 										<div class="empty-state">Folder listing unavailable.</div>
-									{:else if data.inventory.directories.length === 0 && !data.inventory.parentPath}
-										<div class="empty-state">No folders in this location.</div>
+									{:else if filteredDirectories.length === 0}
+										<div class="empty-state">
+											{normalizedInventorySearchQuery ? 'No folders match your search.' : 'No folders in this location.'}
+										</div>
 									{:else}
-										{#each data.inventory.directories as folder}
+										{#each filteredDirectories as folder}
 											<a
 												class="forge-folder-item"
 												href={toPathHref(folder.nextPath)}
@@ -2269,7 +2528,7 @@
 									on:pointerenter={playHoverSfx}
 									on:focus={playHoverSfx}
 									on:click={openForgePicker}
-									disabled={!forgeUploadsEnabled}
+									disabled={!forgeUploadsEnabled || forgePreparing}
 								>
 									File Grabber
 								</button>
@@ -2279,11 +2538,23 @@
 									on:pointerenter={playHoverSfx}
 									on:focus={playHoverSfx}
 									on:click={openForgeFolderPicker}
-									disabled={!forgeUploadsEnabled}
+									disabled={!forgeUploadsEnabled || forgePreparing}
 								>
 									Folder Grabber
 								</button>
 							</div>
+							{#if forgePreparing}
+								<div class="forge-prep-status" role="status" aria-live="polite">
+									<p class="forge-prep-copy">{forgePreparationLabel || 'Preparing uploads...'}</p>
+									<div class="forge-progress forge-progress-prep">
+										<span style={`width: ${forgePreparationProgress}%;`}></span>
+									</div>
+								</div>
+							{:else if activeTransferCount > 0}
+								<p class="forge-prep-copy" role="status" aria-live="polite">
+									Uploading {activeTransferCount} file{activeTransferCount === 1 ? '' : 's'}...
+								</p>
+							{/if}
 						</div>
 						{#if forgeDropError}
 							<p class="forge-error">{forgeDropError}</p>
@@ -2318,7 +2589,7 @@
 									<div class="empty-state">No uploads yet.</div>
 								{:else}
 									<div class="forge-log-list">
-										{#each transferItems as item (item.id)}
+										{#each visibleTransferItems as item (item.id)}
 											<article
 												class="forge-log-item"
 												class:status-error={item.status === 'error'}
@@ -2339,7 +2610,7 @@
 													<p class="forge-log-error">{item.error}</p>
 												{/if}
 												<div class="forge-log-actions">
-													{#if item.status === 'queued' || item.status === 'uploading'}
+													{#if isTransferActive(item.status)}
 														<button
 															type="button"
 															class="forge-log-btn"
@@ -2364,6 +2635,12 @@
 												</div>
 											</article>
 										{/each}
+										{#if hiddenTransferItemCount > 0}
+											<p class="forge-log-hidden">
+												Showing latest {visibleTransferItems.length} entries. {hiddenTransferItemCount} more
+												queued/history item{hiddenTransferItemCount === 1 ? '' : 's'} hidden.
+											</p>
+										{/if}
 									</div>
 								{/if}
 							</div>
@@ -2378,6 +2655,8 @@
 		open={viewerOpen}
 		playHoverSfx={playHoverSfx}
 		playMenuItemSfx={playMenuItemSfx}
+		canGoPrevious={canGoToPreviousFile}
+		canGoNext={canGoToNextFile}
 		file={
 			activeFile
 				? {
@@ -2390,6 +2669,8 @@
 				: null
 		}
 		on:close={closeFileViewer}
+		on:previous={() => goToViewerSiblingFile(-1)}
+		on:next={() => goToViewerSiblingFile(1)}
 	/>
 
 	<FileActionDialog
@@ -2577,6 +2858,12 @@
 		color: rgba(245, 248, 255, 0.95);
 	}
 
+	.sidebar-tabs-wrap {
+		display: grid;
+		gap: 0.55rem;
+		align-content: start;
+	}
+
 	.sidebar-tabs {
 		display: grid;
 		grid-template-columns: 1fr 1fr;
@@ -2607,6 +2894,39 @@
 		border-color: rgba(250, 238, 58, 0.86);
 		background: rgba(250, 238, 58, 0.24);
 		color: rgba(248, 250, 255, 0.98);
+	}
+
+	.sidebar-search {
+		display: grid;
+		gap: 0.3rem;
+	}
+
+	.sidebar-search-label {
+		font-size: 0.56rem;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: var(--cc-text-secondary);
+	}
+
+	.sidebar-search-input {
+		height: 30px;
+		width: 100%;
+		border: 1px solid rgba(160, 168, 180, 0.58);
+		background: rgba(10, 10, 10, 0.34);
+		color: var(--cc-text-primary);
+		padding: 0 0.52rem;
+		font-size: 0.62rem;
+		letter-spacing: 0.06em;
+	}
+
+	.sidebar-search-input::placeholder {
+		color: var(--cc-text-secondary);
+	}
+
+	.sidebar-search-input:focus-visible {
+		outline: 1px solid rgba(250, 238, 58, 0.84);
+		outline-offset: 1px;
+		border-color: rgba(250, 238, 58, 0.74);
 	}
 
 	.sidebar-bottom-panel {
@@ -2942,6 +3262,31 @@
 		display: inline-flex;
 		align-items: center;
 		gap: 0.42rem;
+	}
+
+	.sidebar-file-selection-tools {
+		display: grid;
+		gap: 0.45rem;
+		margin-top: 0.45rem;
+		padding-top: 0.55rem;
+		border-top: 1px solid var(--cc-panel-border-soft);
+	}
+
+	.sidebar-file-selection-actions {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 0.42rem;
+	}
+
+	.sidebar-file-selection-actions .file-selection-btn {
+		width: 100%;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.sidebar-delete-selected-btn {
+		grid-column: 1 / -1;
 	}
 
 	.file-selection-count {
@@ -3386,6 +3731,28 @@
 		color: var(--cc-text-secondary);
 	}
 
+	.forge-prep-status {
+		width: min(520px, 100%);
+		display: grid;
+		gap: 0.34rem;
+	}
+
+	.forge-prep-copy {
+		margin: 0;
+		font-size: 0.6rem;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		color: rgba(237, 241, 248, 0.92);
+	}
+
+	.forge-progress-prep {
+		height: 6px;
+	}
+
+	.forge-progress-prep > span {
+		transition: width 0.18s ease;
+	}
+
 	.forge-folder-nav {
 		width: min(560px, 100%);
 		display: grid;
@@ -3644,6 +4011,14 @@
 		background: linear-gradient(90deg, rgba(250, 238, 58, 0.9), rgba(53, 184, 101, 0.9));
 	}
 
+	.forge-log-hidden {
+		margin: 0.1rem 0 0;
+		font-size: 0.58rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--cc-text-secondary);
+	}
+
 	.forge-log-error {
 		margin: 0;
 		font-size: 0.58rem;
@@ -3704,6 +4079,10 @@
 		.file-selection-tools {
 			width: 100%;
 			flex-wrap: wrap;
+		}
+
+		.sidebar-file-selection-actions {
+			grid-template-columns: 1fr;
 		}
 
 		.folder-create {
