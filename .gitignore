@@ -17,6 +17,8 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.test
+deploy/ubuntu/copyparty.env
+!deploy/ubuntu/*.env.example
 
 # Claude Code
 .claude/

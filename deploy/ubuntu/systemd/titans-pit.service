@@ -1,0 +1,17 @@
+[Unit]
+Description=Titan's Pit
+After=network-online.target copyparty.service
+Wants=network-online.target copyparty.service
+
+[Service]
+Type=simple
+User=titanspit
+Group=titanspit
+WorkingDirectory=/srv/titans-pit
+ExecStart=/bin/bash /srv/titans-pit/deploy/ubuntu/start-titans-pit.sh
+Environment=NODE_ENV=production
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

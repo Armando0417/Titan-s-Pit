@@ -1,0 +1,16 @@
+[Unit]
+Description=Copyparty for Titan's Pit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=titanspit
+Group=titanspit
+WorkingDirectory=/srv/titans-pit
+ExecStart=/bin/bash /srv/titans-pit/deploy/ubuntu/start-copyparty.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
