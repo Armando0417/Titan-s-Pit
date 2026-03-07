@@ -17,11 +17,15 @@
 	export let error = '';
 	export let playHoverSfx: (() => void) | null = null;
 	export let playMenuItemSfx: (() => void) | null = null;
+	export let deleteLabel = 'Delete';
+	export let showRestore = false;
+	export let restoreLabel = 'Restore';
 
 	const dispatch = createEventDispatcher<{
 		close: void;
 		rename: { nextName: string };
 		delete: void;
+		restore: void;
 	}>();
 
 	let renameInput = '';
@@ -65,6 +69,15 @@
 
 		playMenuItemSfx?.();
 		dispatch('delete');
+	}
+
+	function onRestoreClick() {
+		if (!file || busy) {
+			return;
+		}
+
+		playMenuItemSfx?.();
+		dispatch('restore');
 	}
 
 	function onWindowKeydown(event: KeyboardEvent) {
@@ -172,6 +185,18 @@
 				>
 					Download
 				</a>
+				{#if showRestore}
+					<button
+						type="button"
+						class="action-btn"
+						on:pointerenter={playHoverSfx}
+						on:focus={playHoverSfx}
+						on:click={onRestoreClick}
+						disabled={busy}
+					>
+						{restoreLabel}
+					</button>
+				{/if}
 				<button
 					type="button"
 					class="danger-btn"
@@ -180,7 +205,7 @@
 					on:click={onDeleteClick}
 					disabled={busy}
 				>
-					Delete
+					{deleteLabel}
 				</button>
 			</footer>
 		</div>
@@ -225,6 +250,10 @@
 		gap: 0.6rem;
 	}
 
+	.header > div {
+		min-width: 0;
+	}
+
 	.header strong {
 		display: block;
 		font-size: 0.74rem;
@@ -236,6 +265,9 @@
 		font-size: 0.66rem;
 		letter-spacing: 0.08em;
 		opacity: 0.75;
+		display: block;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.close-btn {
@@ -266,6 +298,7 @@
 		display: flex;
 		justify-content: space-between;
 		gap: 0.55rem;
+		min-width: 0;
 		padding: 0.32rem 0.42rem;
 		border: 1px solid rgba(158, 166, 176, 0.45);
 		background: rgba(255, 255, 255, 0.03);
@@ -281,9 +314,10 @@
 	.meta-grid strong {
 		font-size: 0.62rem;
 		letter-spacing: 0.07em;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		min-width: 0;
+		text-align: right;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.rename-row {
@@ -303,10 +337,12 @@
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
+		min-width: 0;
 	}
 
 	.rename-row input {
 		flex: 1;
+		min-width: 0;
 		height: 30px;
 		border: 1px solid rgba(160, 168, 180, 0.58);
 		background: rgba(0, 0, 0, 0.32);
@@ -355,6 +391,7 @@
 
 	.raw-wrap pre {
 		flex: 1;
+		min-width: 0;
 		min-height: 180px;
 		max-height: min(42dvh, 420px);
 		margin: 0;
@@ -364,6 +401,9 @@
 		font-size: 0.63rem;
 		line-height: 1.45;
 		overflow: auto;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.error-text {
@@ -379,9 +419,11 @@
 		align-items: center;
 		justify-content: flex-end;
 		gap: 0.45rem;
+		flex-wrap: wrap;
 	}
 
 	.action-link,
+	.action-btn,
 	.danger-btn {
 		height: 30px;
 		display: inline-flex;
@@ -401,6 +443,8 @@
 
 	.action-link:hover,
 	.action-link:focus-visible,
+	.action-btn:hover:enabled,
+	.action-btn:focus-visible:enabled,
 	.danger-btn:hover:enabled,
 	.danger-btn:focus-visible:enabled {
 		border-color: rgba(250, 238, 58, 0.78);
@@ -412,6 +456,7 @@
 		color: rgba(248, 224, 224, 0.94);
 	}
 
+	.action-btn:disabled,
 	.danger-btn:disabled {
 		cursor: default;
 		opacity: 0.45;
@@ -424,6 +469,28 @@
 
 		.meta-grid {
 			grid-template-columns: 1fr;
+		}
+
+		.meta-grid div {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+
+		.meta-grid strong {
+			text-align: left;
+		}
+
+		.rename-row > div {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+		.actions {
+			justify-content: stretch;
+		}
+
+		.actions > * {
+			flex: 1 1 140px;
 		}
 	}
 </style>

@@ -16,7 +16,7 @@
 	export let canGoPrevious = false;
 	export let canGoNext = false;
 
-	const dispatch = createEventDispatcher<{ close: void; previous: void; next: void }>();
+	const dispatch = createEventDispatcher<{ close: void; previous: void; next: void; menu: void }>();
 
 	const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'svg', 'bmp']);
 	const VIDEO_EXTENSIONS = new Set(['mp4', 'mkv', 'webm', 'mov', 'm4v', 'avi', 'ogv', 'ogg']);
@@ -60,6 +60,11 @@
 		}
 		onModalMenuAction();
 		dispatch('next');
+	}
+
+	function onMenuButtonClick() {
+		onModalMenuAction();
+		dispatch('menu');
 	}
 
 	function onWindowKeydown(event: KeyboardEvent) {
@@ -161,6 +166,15 @@
 					>
 						Download
 					</a>
+					<button
+						class="close-btn"
+						type="button"
+						on:pointerenter={onModalButtonHover}
+						on:focus={onModalButtonHover}
+						on:click={onMenuButtonClick}
+					>
+						Menu
+					</button>
 					<button
 						class="close-btn"
 						type="button"

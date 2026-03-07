@@ -36,6 +36,8 @@ export type InventoryData = {
 	currentPath: string;
 	parentPath: string | null;
 	rootPath: string;
+	trashPath: string;
+	isTrashView: boolean;
 	uploadUrl: string;
 	directories: InventoryEntry[];
 	files: InventoryEntry[];
@@ -54,6 +56,7 @@ type CopypartyConnection = {
 };
 
 const DEFAULT_TIMEOUT_MS = 8_000;
+const DEFAULT_TRASH_PATH = '/_titans_pit_trash';
 const collator = new Intl.Collator('en', { numeric: true, sensitivity: 'base' });
 const modifiedFormatter = new Intl.DateTimeFormat('en-US', {
 	month: 'short',
@@ -75,6 +78,8 @@ export async function getInventoryData({
 	const currentPath = normalizePath(requestedPath ?? '/');
 	const parentPath = getParentPath(currentPath);
 	const rootPath = normalizePath(env.COPYPARTY_ROOT_PATH ?? '/');
+	const trashPath = getTrashPath();
+	const isTrashView = isPathInside(currentPath, trashPath);
 	const baseUrl = env.COPYPARTY_BASE_URL?.trim();
 
 	if (!baseUrl) {
@@ -83,6 +88,8 @@ export async function getInventoryData({
 			currentPath,
 			parentPath,
 			rootPath,
+			trashPath,
+			isTrashView,
 			uploadUrl: '',
 			directories: [],
 			files: [],
@@ -137,6 +144,7 @@ export async function getInventoryData({
 
 		const directories = rawDirs
 			.map((item) => mapItem(item, 'dir', { currentPath, rootPath, baseUrl: publicBaseUrl, password }))
+			.filter((entry) => isTrashView || normalizePath(entry.nextPath ?? '') !== trashPath)
 			.sort((a, b) => collator.compare(a.name, b.name));
 
 		const files = rawFiles
@@ -150,6 +158,8 @@ export async function getInventoryData({
 			currentPath,
 			parentPath,
 			rootPath,
+			trashPath,
+			isTrashView,
 			uploadUrl,
 			directories,
 			files,
@@ -164,6 +174,8 @@ export async function getInventoryData({
 			currentPath,
 			parentPath,
 			rootPath,
+			trashPath,
+			isTrashView,
 			uploadUrl: buildUploadUrl(publicBaseUrl, upstreamPath, password),
 			directories: [],
 			files: [],
@@ -221,18 +233,97 @@ export async function deleteInventoryPath({
 }): Promise<void> {
 	const connection = getCopypartyConnection();
 	const normalizedPath = normalizePath(targetPath);
+	const trashPath = getTrashPath();
 	if (normalizedPath === '/') {
 		throw new Error('Cannot delete root path.');
 	}
-
-	const url = buildScopedUrl(connection, normalizedPath);
-	const response = await fetchCopyparty(connection, fetch, url, {
-		method: 'DELETE'
-	}, requestCookie);
-
-	if (!response.ok) {
-		throw new Error(await buildHttpErrorMessage('Delete failed', response));
+	if (normalizedPath === trashPath) {
+		throw new Error('Cannot delete the trash root.');
 	}
+
+	if (isPathInside(normalizedPath, trashPath)) {
+		const url = buildScopedUrl(connection, normalizedPath);
+		const response = await fetchCopyparty(
+			connection,
+			fetch,
+			url,
+			{
+				method: 'DELETE'
+			},
+			requestCookie
+		);
+
+		if (!response.ok) {
+			throw new Error(await buildHttpErrorMessage('Delete failed', response));
+		}
+		return;
+	}
+
+	const trashDestinationDirectory = resolveTrashMirrorDirectory(normalizedPath, trashPath);
+	await ensureScopedDirectory({
+		connection,
+		fetch,
+		directoryPath: trashDestinationDirectory,
+		requestCookie
+	});
+
+	const leafName = getPathLeafName(normalizedPath);
+	if (!leafName) {
+		throw new Error('Invalid delete target.');
+	}
+
+	await moveScopedPathWithCollisionHandling({
+		connection,
+		fetch,
+		sourcePath: normalizedPath,
+		destinationDirectory: trashDestinationDirectory,
+		targetLeafName: leafName,
+		requestCookie,
+		errorPrefix: 'Move to trash failed',
+		collisionLabel: 'trashed'
+	});
+}
+
+export async function restoreInventoryPath({
+	fetch,
+	targetPath,
+	requestCookie
+}: {
+	fetch: FetchLike;
+	targetPath: string;
+	requestCookie?: string;
+}): Promise<void> {
+	const connection = getCopypartyConnection();
+	const trashPath = getTrashPath();
+	const normalizedPath = normalizePath(targetPath);
+	if (!isPathInside(normalizedPath, trashPath) || normalizedPath === trashPath) {
+		throw new Error('Path is not inside trash.');
+	}
+
+	const restoreDestination = stripTrashPrefix(normalizedPath, trashPath);
+	const destinationParentPath = getParentPath(restoreDestination);
+	const leafName = getPathLeafName(restoreDestination);
+	if (!destinationParentPath || !leafName) {
+		throw new Error('Unable to resolve restore destination.');
+	}
+
+	await ensureScopedDirectory({
+		connection,
+		fetch,
+		directoryPath: destinationParentPath,
+		requestCookie
+	});
+
+	await moveScopedPathWithCollisionHandling({
+		connection,
+		fetch,
+		sourcePath: normalizedPath,
+		destinationDirectory: destinationParentPath,
+		targetLeafName: leafName,
+		requestCookie,
+		errorPrefix: 'Restore failed',
+		collisionLabel: 'restored'
+	});
 }
 
 export async function renameInventoryPath({
@@ -341,6 +432,45 @@ export async function createInventoryDirectory({
 	throw new Error(await buildHttpErrorMessage('Create folder failed', response));
 }
 
+async function ensureScopedDirectory({
+	connection,
+	fetch,
+	directoryPath,
+	requestCookie
+}: {
+	connection: CopypartyConnection;
+	fetch: FetchLike;
+	directoryPath: string;
+	requestCookie?: string;
+}): Promise<void> {
+	const normalizedDirectoryPath = normalizePath(directoryPath);
+	if (normalizedDirectoryPath === '/') {
+		return;
+	}
+
+	let cursor = '/';
+	for (const segment of normalizedDirectoryPath.split('/').filter(Boolean)) {
+		cursor = joinPaths(cursor, segment);
+		const url = buildScopedUrl(connection, cursor);
+		url.pathname = ensureTrailingSlash(url.pathname);
+		const response = await fetchCopyparty(
+			connection,
+			fetch,
+			url,
+			{
+				method: 'MKCOL'
+			},
+			requestCookie
+		);
+
+		if (response.ok || response.status === 405 || response.status === 409) {
+			continue;
+		}
+
+		throw new Error(await buildHttpErrorMessage(`Create folder failed for ${cursor}`, response));
+	}
+}
+
 function buildListingUrl(baseUrl: string, virtualPath: string): URL {
 	const url = new URL(baseUrl);
 	url.pathname = joinPaths(url.pathname, virtualPath);
@@ -442,13 +572,99 @@ async function moveScopedPath({
 	requestCookie?: string;
 	errorPrefix: string;
 }): Promise<void> {
+	const response = await tryMoveScopedPath({
+		connection,
+		fetch,
+		sourcePath,
+		destinationPath,
+		requestCookie,
+		overwrite: true
+	});
+
+	if (!response.ok) {
+		throw new Error(await buildHttpErrorMessage(errorPrefix, response));
+	}
+}
+
+async function moveScopedPathWithCollisionHandling({
+	connection,
+	fetch,
+	sourcePath,
+	destinationDirectory,
+	targetLeafName,
+	requestCookie,
+	errorPrefix,
+	collisionLabel
+}: {
+	connection: CopypartyConnection;
+	fetch: FetchLike;
+	sourcePath: string;
+	destinationDirectory: string;
+	targetLeafName: string;
+	requestCookie?: string;
+	errorPrefix: string;
+	collisionLabel: string;
+}): Promise<string> {
+	let destinationPath = joinPaths(destinationDirectory, targetLeafName);
+	let response = await tryMoveScopedPath({
+		connection,
+		fetch,
+		sourcePath,
+		destinationPath,
+		requestCookie,
+		overwrite: false
+	});
+
+	if (response.ok) {
+		return destinationPath;
+	}
+
+	if (!isPathConflictStatus(response.status)) {
+		throw new Error(await buildHttpErrorMessage(errorPrefix, response));
+	}
+
+	destinationPath = joinPaths(
+		destinationDirectory,
+		appendCollisionSuffix(targetLeafName, buildCollisionToken(collisionLabel))
+	);
+	response = await tryMoveScopedPath({
+		connection,
+		fetch,
+		sourcePath,
+		destinationPath,
+		requestCookie,
+		overwrite: false
+	});
+
+	if (!response.ok) {
+		throw new Error(await buildHttpErrorMessage(errorPrefix, response));
+	}
+
+	return destinationPath;
+}
+
+async function tryMoveScopedPath({
+	connection,
+	fetch,
+	sourcePath,
+	destinationPath,
+	requestCookie,
+	overwrite
+}: {
+	connection: CopypartyConnection;
+	fetch: FetchLike;
+	sourcePath: string;
+	destinationPath: string;
+	requestCookie?: string;
+	overwrite: boolean;
+}): Promise<Response> {
 	const sourceUrl = buildScopedUrl(connection, sourcePath);
 	const destinationUrl = buildScopedUrl(connection, destinationPath);
 	// Copyparty treats WebDAV Destination as a path; query/hash fragments become part of the
 	// destination filename on Windows and can trigger HTTP 422.
 	destinationUrl.search = '';
 	destinationUrl.hash = '';
-	const response = await fetchCopyparty(
+	return await fetchCopyparty(
 		connection,
 		fetch,
 		sourceUrl,
@@ -456,15 +672,11 @@ async function moveScopedPath({
 			method: 'MOVE',
 			headers: {
 				Destination: destinationUrl.toString(),
-				Overwrite: 'T'
+				Overwrite: overwrite ? 'T' : 'F'
 			}
 		},
 		requestCookie
 	);
-
-	if (!response.ok) {
-		throw new Error(await buildHttpErrorMessage(errorPrefix, response));
-	}
 }
 
 function sanitizeLeafName(value: string, label: string): string {
@@ -667,6 +879,68 @@ function getParentPath(path: string): string | null {
 function getPathLeafName(path: string): string | null {
 	const segments = path.split('/').filter(Boolean);
 	return segments.length > 0 ? segments[segments.length - 1] : null;
+}
+
+function getTrashPath(): string {
+	const configured = env.COPYPARTY_TRASH_PATH?.trim();
+	if (!configured) {
+		return DEFAULT_TRASH_PATH;
+	}
+
+	const normalized = normalizePath(configured);
+	return normalized === '/' ? DEFAULT_TRASH_PATH : normalized;
+}
+
+function isPathInside(path: string, containerPath: string): boolean {
+	const normalizedPath = normalizePath(path);
+	const normalizedContainerPath = normalizePath(containerPath);
+	return (
+		normalizedPath === normalizedContainerPath ||
+		normalizedPath.startsWith(`${normalizedContainerPath}/`)
+	);
+}
+
+function resolveTrashMirrorDirectory(path: string, trashPath: string): string {
+	const parentPath = getParentPath(path);
+	if (!parentPath || parentPath === '/') {
+		return trashPath;
+	}
+
+	return joinPaths(trashPath, parentPath);
+}
+
+function stripTrashPrefix(path: string, trashPath: string): string {
+	const normalizedPath = normalizePath(path);
+	const normalizedTrashPath = normalizePath(trashPath);
+	const suffix = normalizedPath.slice(normalizedTrashPath.length);
+	return normalizePath(suffix || '/');
+}
+
+function isPathConflictStatus(status: number): boolean {
+	return status === 409 || status === 412;
+}
+
+function appendCollisionSuffix(name: string, suffix: string): string {
+	const dotIndex = name.lastIndexOf('.');
+	if (dotIndex <= 0 || dotIndex >= name.length - 1) {
+		return `${name}-${suffix}`;
+	}
+
+	return `${name.slice(0, dotIndex)}-${suffix}${name.slice(dotIndex)}`;
+}
+
+function buildCollisionToken(label: string): string {
+	const date = new Date();
+	const parts = [
+		date.getFullYear(),
+		String(date.getMonth() + 1).padStart(2, '0'),
+		String(date.getDate()).padStart(2, '0'),
+		String(date.getHours()).padStart(2, '0'),
+		String(date.getMinutes()).padStart(2, '0'),
+		String(date.getSeconds()).padStart(2, '0')
+	];
+	const randomFragment = Math.random().toString(36).slice(2, 6);
+	return `${label}-${parts.join('')}-${randomFragment}`;
 }
 
 function joinPaths(base: string, child: string): string {

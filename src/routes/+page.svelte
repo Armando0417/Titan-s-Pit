@@ -4,6 +4,7 @@
 	import type { PageData } from './$types';
 	import FileViewerModal from '$lib/components/FileViewerModal.svelte';
 	import FileActionDialog from '$lib/components/FileActionDialog.svelte';
+	import UploadCompleteDialog from '$lib/components/UploadCompleteDialog.svelte';
 	import UploadConflictDialog from '$lib/components/UploadConflictDialog.svelte';
 	import clickItem2Sfx from '$lib/assets/sfx/click_item_2.m4a';
 	import confirmClickSfx from '$lib/assets/sfx/confirm_click_sfx.m4a';
@@ -30,6 +31,11 @@
 		modified: string;
 		href: string;
 	};
+	type PathBreadcrumb = {
+		label: string;
+		path: string;
+		current: boolean;
+	};
 
 	type SortKey = 'name' | 'type' | 'size' | 'modified';
 	type SortDirection = 'asc' | 'desc';
@@ -39,7 +45,6 @@
 	type ConflictStrategy = 'rename' | 'replace' | 'skip';
 	type TransferItem = {
 		id: string;
-		file: File;
 		sourceName: string;
 		targetName: string;
 		targetPath: string;
@@ -53,6 +58,7 @@
 		replaceExisting: boolean;
 		error?: string;
 		xhr?: XMLHttpRequest;
+		sessionRecorded?: boolean;
 	};
 	type UploadConflictItem = {
 		name: string;
@@ -61,6 +67,12 @@
 	type UploadCandidate = {
 		file: File;
 		relativePath: string;
+	};
+	type UploadCompletionSummary = {
+		total: number;
+		completed: number;
+		failed: number;
+		canceled: number;
 	};
 	type FileSystemEntryLike = {
 		isFile: boolean;
@@ -151,11 +163,14 @@
 	let filteredSortedFiles: InventoryFile[] = [];
 	let inventorySearchQuery = '';
 	let normalizedInventorySearchQuery = '';
+	let inventorySearchInput: HTMLInputElement | null = null;
 	let filteredDirectories = data.inventory.directories;
 	let fileViewMode: 'list' | 'grid' = 'list';
 	let foldersPanelExpanded = false;
 	let activeSidebarTab: SidebarTab = data.initialTab;
 	let sidebarTabSyncKey = `${data.inventory.currentPath}|${data.initialTab}`;
+	let navigationParentPath: string | null = null;
+	let navigationBreadcrumbs: PathBreadcrumb[] = [];
 	const sfxCache: Partial<Record<SfxKey, HTMLAudioElement>> = {};
 	const hoverSfxPool: HTMLAudioElement[] = [];
 	let hoverSfxPoolCursor = 0;
@@ -192,6 +207,13 @@
 	let uploadConflictItems: UploadConflictItem[] = [];
 	let pendingUploadFiles: UploadCandidate[] = [];
 	let pendingUploadDestinationPath = '';
+	let uploadCompleteOpen = false;
+	let uploadCompleteSummary: UploadCompletionSummary = {
+		total: 0,
+		completed: 0,
+		failed: 0,
+		canceled: 0
+	};
 	let selectedFileNames = new Set<string>();
 	let selectedFileCount = 0;
 	let allFilesSelected = false;
@@ -204,6 +226,8 @@
 	let folderDeleteError = '';
 	const ensuredUploadPaths = new Set<string>(['/']);
 	const ensureUploadPathTasks = new Map<string, Promise<FileActionResponse>>();
+	const uploadPayloads = new Map<string, File>();
+	let activeUploadSession: UploadCompletionSummary | null = null;
 
 	function isLikelyMobileClient(): boolean {
 		if (!browser) {
@@ -380,8 +404,12 @@
 		playSfx('folderClick');
 	}
 
-	function onFileRowClick(file: InventoryFile) {
+	function playFileClickSfx() {
 		playSfx('fileClick');
+	}
+
+	function onFileRowClick(file: InventoryFile) {
+		playFileClickSfx();
 		if (previewSelectedFileName !== file.name) {
 			previewSelectedFileName = file.name;
 			return;
@@ -418,6 +446,117 @@
 
 		playMenuItemSfx();
 		foldersPanelExpanded = false;
+	}
+
+	function onPanelBackgroundClick(event: MouseEvent, panel: 'folders' | 'files') {
+		const target = event.target;
+		if (!(target instanceof Element)) {
+			return;
+		}
+
+		if (
+			target.closest(
+				'a, button, input, textarea, select, label, [role="button"], .folder-item-shell, .folder-create'
+			)
+		) {
+			return;
+		}
+
+		if (panel === 'folders') {
+			if (foldersPanelExpanded) {
+				return;
+			}
+
+			playMenuItemSfx();
+			foldersPanelExpanded = true;
+			return;
+		}
+
+		if (!foldersPanelExpanded) {
+			return;
+		}
+
+		playMenuItemSfx();
+		foldersPanelExpanded = false;
+	}
+
+	function panelBackgroundExpand(node: HTMLElement, panel: 'folders' | 'files') {
+		let activePanel = panel;
+
+		const handleClick = (event: MouseEvent) => {
+			onPanelBackgroundClick(event, activePanel);
+		};
+
+		node.addEventListener('click', handleClick);
+
+		return {
+			update(nextPanel: 'folders' | 'files') {
+				activePanel = nextPanel;
+			},
+			destroy() {
+				node.removeEventListener('click', handleClick);
+			}
+		};
+	}
+
+	function setFileViewMode(mode: 'list' | 'grid') {
+		if (fileViewMode === mode) {
+			return;
+		}
+
+		playFileClickSfx();
+		fileViewMode = mode;
+	}
+
+	function isEditableTarget(target: EventTarget | null): boolean {
+		if (!(target instanceof HTMLElement)) {
+			return false;
+		}
+
+		if (target.isContentEditable || target.closest('[contenteditable="true"]')) {
+			return true;
+		}
+
+		const tagName = target.tagName;
+		return tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
+	}
+
+	function focusInventorySearch(selectContents = false) {
+		if (!inventorySearchInput) {
+			return;
+		}
+
+		inventorySearchInput.focus();
+		if (selectContents) {
+			inventorySearchInput.select();
+		}
+	}
+
+	function onGlobalKeydown(event: KeyboardEvent) {
+		if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) {
+			return;
+		}
+
+		if (event.key === '/') {
+			if (isEditableTarget(event.target)) {
+				return;
+			}
+
+			event.preventDefault();
+			playMenuItemSfx();
+			focusInventorySearch(true);
+			return;
+		}
+
+		if (event.key === 'Escape' && browser && document.activeElement === inventorySearchInput) {
+			event.preventDefault();
+			if (inventorySearchQuery) {
+				inventorySearchQuery = '';
+				return;
+			}
+
+			inventorySearchInput?.blur();
+		}
 	}
 
 	function joinInventoryPath(nameOrPath: string): string {
@@ -465,6 +604,95 @@
 
 	function formatPathLabel(path: string): string {
 		return path === '/' ? '/' : path;
+	}
+
+	function isTrashPath(path: string): boolean {
+		const normalizedPath = normalizeInventoryPath(path);
+		const trashPath = normalizeInventoryPath(data.inventory.trashPath);
+		return normalizedPath === trashPath || normalizedPath.startsWith(`${trashPath}/`);
+	}
+
+	function trashDisplayLabel(path = data.inventory.currentPath): string {
+		const normalizedPath = normalizeInventoryPath(path);
+		const trashPath = normalizeInventoryPath(data.inventory.trashPath);
+		if (normalizedPath === trashPath) {
+			return '/';
+		}
+
+		return normalizedPath.startsWith(`${trashPath}/`)
+			? normalizedPath.slice(trashPath.length) || '/'
+			: normalizedPath;
+	}
+
+	function getNavigationParentPath(): string | null {
+		const currentPath = normalizeInventoryPath(data.inventory.currentPath);
+		const trashPath = normalizeInventoryPath(data.inventory.trashPath);
+		if (data.inventory.isTrashView && currentPath === trashPath) {
+			return null;
+		}
+
+		return data.inventory.parentPath;
+	}
+
+	function buildNavigationBreadcrumbs(path: string): PathBreadcrumb[] {
+		const currentPath = normalizeInventoryPath(path);
+		const crumbs: PathBreadcrumb[] = [];
+
+		if (data.inventory.isTrashView) {
+			const trashPath = normalizeInventoryPath(data.inventory.trashPath);
+			crumbs.push({
+				label: 'Trash',
+				path: trashPath,
+				current: currentPath === trashPath
+			});
+
+			if (currentPath !== trashPath && currentPath.startsWith(`${trashPath}/`)) {
+				let cursor = trashPath;
+				for (const segment of currentPath.slice(trashPath.length).split('/').filter(Boolean)) {
+					cursor = normalizeInventoryPath(`${cursor}/${segment}`);
+					crumbs.push({
+						label: segment,
+						path: cursor,
+						current: false
+					});
+				}
+			}
+		} else {
+			crumbs.push({
+				label: 'Vault',
+				path: '/',
+				current: currentPath === '/'
+			});
+
+			if (currentPath !== '/') {
+				let cursor = '';
+				for (const segment of currentPath.split('/').filter(Boolean)) {
+					cursor = cursor ? `${cursor}/${segment}` : `/${segment}`;
+					crumbs.push({
+						label: segment,
+						path: cursor,
+						current: false
+					});
+				}
+			}
+		}
+
+		return crumbs.map((crumb, index) => ({
+			...crumb,
+			current: index === crumbs.length - 1
+		}));
+	}
+
+	function deleteActionLabel(): string {
+		return data.inventory.isTrashView ? 'Delete permanently' : 'Move to trash';
+	}
+
+	function deleteActionVerbPastTense(): string {
+		return data.inventory.isTrashView ? 'Deleted' : 'Moved to trash';
+	}
+
+	function deleteActionVerbPresent(): string {
+		return data.inventory.isTrashView ? 'delete permanently' : 'move to trash';
 	}
 
 	function joinNormalizedPaths(base: string, child: string): string {
@@ -1087,7 +1315,9 @@
 
 		if (browser) {
 			const confirmed = window.confirm(
-				`Delete ${selectedPaths.length} selected file${selectedPaths.length === 1 ? '' : 's'}?`
+				data.inventory.isTrashView
+					? `Delete ${selectedPaths.length} selected file${selectedPaths.length === 1 ? '' : 's'} permanently?`
+					: `Move ${selectedPaths.length} selected file${selectedPaths.length === 1 ? '' : 's'} to trash?`
 			);
 			if (!confirmed) {
 				return;
@@ -1109,7 +1339,9 @@
 			});
 
 			if (!result.ok) {
-				firstError = `${getInventoryLeafName(sourcePath)}: ${result.error || 'Unable to delete file.'}`;
+				firstError = `${getInventoryLeafName(sourcePath)}: ${
+					result.error || (data.inventory.isTrashView ? 'Unable to delete file.' : 'Unable to move file to trash.')
+				}`;
 				break;
 			}
 
@@ -1137,7 +1369,61 @@
 		if (firstError) {
 			moveFilesError =
 				deletedCount > 0
-					? `Deleted ${deletedCount} file${deletedCount === 1 ? '' : 's'}; stopped at ${firstError}`
+					? `${deleteActionVerbPastTense()} ${deletedCount} file${deletedCount === 1 ? '' : 's'}; stopped at ${firstError}`
+					: firstError;
+			return;
+		}
+
+		moveFilesError = '';
+	}
+
+	async function onRestoreSelectedFiles() {
+		if (isInventoryBusy() || selectedFileCount === 0 || !data.inventory.isTrashView) {
+			return;
+		}
+
+		const selectedPaths = getSelectedFilePaths();
+		if (selectedPaths.length === 0) {
+			moveFilesError = 'No files selected.';
+			return;
+		}
+
+		moveFilesBusy = true;
+		moveFilesError = '';
+		playMenuItemSfx();
+
+		let restoredCount = 0;
+		let firstError = '';
+
+		for (const sourcePath of selectedPaths) {
+			const result = await postFileAction({
+				action: 'restore',
+				path: sourcePath
+			});
+
+			if (!result.ok) {
+				firstError = `${getInventoryLeafName(sourcePath)}: ${result.error || 'Unable to restore file.'}`;
+				break;
+			}
+
+			restoredCount += 1;
+		}
+
+		moveFilesBusy = false;
+
+		if (restoredCount > 0) {
+			clearSelectedFiles();
+			const viewerFileName = activeFile?.name;
+			if (viewerFileName && selectedPaths.some((path) => getInventoryLeafName(path) === viewerFileName)) {
+				closeFileViewer();
+			}
+			await invalidateAll();
+		}
+
+		if (firstError) {
+			moveFilesError =
+				restoredCount > 0
+					? `Restored ${restoredCount} file${restoredCount === 1 ? '' : 's'}; stopped at ${firstError}`
 					: firstError;
 			return;
 		}
@@ -1148,6 +1434,10 @@
 	function openFileActionDialog(event: MouseEvent, file: InventoryFile) {
 		event.stopPropagation();
 		event.preventDefault();
+		openFileActionDialogForFile(file);
+	}
+
+	function openFileActionDialogForFile(file: InventoryFile) {
 		playMenuItemSfx();
 		playSfx('dialogOpen');
 		fileActionError = '';
@@ -1199,6 +1489,13 @@
 			return;
 		}
 
+		if (browser && data.inventory.isTrashView) {
+			const confirmed = window.confirm(`Delete "${fileActionFile.name}" permanently?`);
+			if (!confirmed) {
+				return;
+			}
+		}
+
 		fileActionBusy = true;
 		fileActionError = '';
 		const currentPath = joinInventoryPath(fileActionFile.name);
@@ -1209,7 +1506,34 @@
 
 		fileActionBusy = false;
 		if (!result.ok) {
-			fileActionError = result.error || 'Unable to delete file.';
+			fileActionError =
+				result.error || (data.inventory.isTrashView ? 'Unable to delete file.' : 'Unable to move file to trash.');
+			return;
+		}
+
+		if (activeFile?.href === fileActionFile.href) {
+			closeFileViewer();
+		}
+		closeFileActionDialog();
+		void invalidateAll();
+	}
+
+	async function onRestoreFile() {
+		if (!fileActionFile || fileActionBusy || !data.inventory.isTrashView) {
+			return;
+		}
+
+		fileActionBusy = true;
+		fileActionError = '';
+		const currentPath = joinInventoryPath(fileActionFile.name);
+		const result = await postFileAction({
+			action: 'restore',
+			path: currentPath
+		});
+
+		fileActionBusy = false;
+		if (!result.ok) {
+			fileActionError = result.error || 'Unable to restore file.';
 			return;
 		}
 
@@ -1234,7 +1558,7 @@
 		newFolderBusy = true;
 		newFolderError = '';
 		folderDeleteError = '';
-		playMenuItemSfx();
+		playFileClickSfx();
 		const result = await postFileAction({
 			action: 'mkdir',
 			path: data.inventory.currentPath,
@@ -1261,7 +1585,9 @@
 
 		if (browser) {
 			const confirmed = window.confirm(
-				`Delete folder "${folderName}" and ALL files/subfolders inside it? This cannot be undone.`
+				data.inventory.isTrashView
+					? `Delete folder "${folderName}" permanently and remove ALL files/subfolders inside it? This cannot be undone.`
+					: `Move folder "${folderName}" and ALL files/subfolders inside it to trash?`
 			);
 			if (!confirmed) {
 				return;
@@ -1280,7 +1606,40 @@
 		folderDeleteBusyPath = null;
 
 		if (!result.ok) {
-			folderDeleteError = `${folderName}: ${result.error || 'Unable to delete folder.'}`;
+			folderDeleteError = `${folderName}: ${
+				result.error || (data.inventory.isTrashView ? 'Unable to delete folder.' : 'Unable to move folder to trash.')
+			}`;
+			return;
+		}
+
+		if (activeFolderDropPath === folderPath) {
+			activeFolderDropPath = null;
+		}
+
+		await invalidateAll();
+	}
+
+	async function onRestoreFolder(event: MouseEvent, folderPath: string | null, folderName: string) {
+		event.preventDefault();
+		event.stopPropagation();
+
+		if (!folderPath || isInventoryBusy() || !data.inventory.isTrashView) {
+			return;
+		}
+
+		folderDeleteBusyPath = folderPath;
+		folderDeleteError = '';
+		playMenuItemSfx();
+
+		const result = await postFileAction({
+			action: 'restore',
+			path: folderPath
+		});
+
+		folderDeleteBusyPath = null;
+
+		if (!result.ok) {
+			folderDeleteError = `${folderName}: ${result.error || 'Unable to restore folder.'}`;
 			return;
 		}
 
@@ -1311,6 +1670,68 @@
 		uploadConflictItems = [];
 		pendingUploadFiles = [];
 		pendingUploadDestinationPath = '';
+	}
+
+	function closeUploadCompleteDialog() {
+		if (uploadCompleteOpen) {
+			playSfx('dialogClose');
+		}
+		uploadCompleteOpen = false;
+	}
+
+	function createEmptyUploadCompletionSummary(): UploadCompletionSummary {
+		return {
+			total: 0,
+			completed: 0,
+			failed: 0,
+			canceled: 0
+		};
+	}
+
+	function ensureActiveUploadSession(): UploadCompletionSummary {
+		if (!activeUploadSession) {
+			activeUploadSession = createEmptyUploadCompletionSummary();
+		}
+		return activeUploadSession;
+	}
+
+	function releaseUploadPayload(transferId: string) {
+		uploadPayloads.delete(transferId);
+	}
+
+	function recordTransferOutcome(item: TransferItem) {
+		if (item.sessionRecorded || !activeUploadSession || isTransferActive(item.status)) {
+			return;
+		}
+
+		item.sessionRecorded = true;
+		if (item.status === 'complete') {
+			activeUploadSession.completed += 1;
+			return;
+		}
+
+		if (item.error === 'Upload canceled') {
+			activeUploadSession.canceled += 1;
+			return;
+		}
+
+		activeUploadSession.failed += 1;
+	}
+
+	function finalizeUploadSessionIfIdle() {
+		if (activeUploads !== 0 || uploadQueue.length !== 0 || !activeUploadSession) {
+			return;
+		}
+
+		const summary = activeUploadSession;
+		activeUploadSession = null;
+		if (summary.total === 0) {
+			return;
+		}
+
+		uploadCompleteSummary = { ...summary };
+		uploadCompleteOpen = true;
+		playSfx('dialogOpen');
 	}
 
 	function onResolveUploadConflict(event: CustomEvent<{ strategy: ConflictStrategy }>) {
@@ -1446,13 +1867,14 @@
 			return;
 		}
 
+		uploadCompleteOpen = false;
 		const normalizedDestinationPath = normalizeInventoryPath(destinationPath);
 		const existingNamesByDestination = new Map<string, Set<string>>([
 			[normalizedDestinationPath, new Set(data.inventory.files.map((entry) => entry.name))]
 		]);
 		const reservedNamesByDestination = new Map<string, Set<string>>();
 		let enqueuedCount = 0;
-		let batchItems: TransferItem[] = [];
+		let batchItems: Array<{ item: TransferItem; file: File }> = [];
 
 		const getReservedNames = (path: string): Set<string> => {
 			const existing = reservedNamesByDestination.get(path);
@@ -1505,9 +1927,8 @@
 					reservedNames.add(targetName);
 				}
 
-				batchItems.push({
+				const item: TransferItem = {
 					id: createTransferId(),
-					file: candidate.file,
 					sourceName,
 					targetName,
 					targetPath: joinNormalizedPaths(resolvedDestinationPath, targetName),
@@ -1519,7 +1940,9 @@
 					progress: 0,
 					status: 'queued',
 					replaceExisting
-				});
+				};
+				batchItems.push({ item, file: candidate.file });
+				ensureActiveUploadSession().total += 1;
 				enqueuedCount += 1;
 
 				const isBatchBoundary = (index + 1) % UPLOAD_ENQUEUE_BATCH_SIZE === 0 || index + 1 === candidates.length;
@@ -1528,8 +1951,12 @@
 				}
 
 				if (batchItems.length > 0) {
-					transferItems.push(...batchItems);
-					uploadQueue.push(...batchItems);
+					const queuedItems = batchItems.map((entry) => entry.item);
+					transferItems.push(...queuedItems);
+					uploadQueue.push(...queuedItems);
+					for (const entry of batchItems) {
+						uploadPayloads.set(entry.item.id, entry.file);
+					}
 					batchItems = [];
 					touchTransferItems(true);
 					processUploadQueue();
@@ -1569,8 +1996,10 @@
 	}
 
 	function finishUpload(item: TransferItem) {
+		releaseUploadPayload(item.id);
 		item.xhr = undefined;
 		activeUploads = Math.max(0, activeUploads - 1);
+		recordTransferOutcome(item);
 		processUploadQueue();
 		pruneFinishedTransferHistory();
 		touchTransferItems(true);
@@ -1579,6 +2008,7 @@
 			needsInventoryRefresh = false;
 			void invalidateAll();
 		}
+		finalizeUploadSessionIfIdle();
 	}
 
 	async function finalizeUploadedItem(item: TransferItem): Promise<void> {
@@ -1639,8 +2069,16 @@
 			}
 		}
 
+		const file = uploadPayloads.get(item.id);
+		if (!file) {
+			item.status = 'error';
+			item.error = 'Upload payload is no longer available.';
+			finishUpload(item);
+			return;
+		}
+
 		const formData = new FormData();
-		formData.append('f', item.file, item.targetName);
+		formData.append('f', file, item.targetName);
 
 		const targetUrl = new URL(item.uploadUrl);
 		targetUrl.searchParams.set('j', '');
@@ -1685,7 +2123,14 @@
 		});
 
 		xhr.open('POST', targetUrl.toString());
-		xhr.send(formData);
+		try {
+			xhr.send(formData);
+			releaseUploadPayload(item.id);
+		} catch {
+			item.status = 'error';
+			item.error = 'Upload failed (browser error)';
+			finishUpload(item);
+		}
 	}
 
 	function cancelTransfer(itemId: string) {
@@ -1701,7 +2146,11 @@
 			}
 			item.status = 'error';
 			item.error = 'Upload canceled';
+			releaseUploadPayload(item.id);
+			recordTransferOutcome(item);
+			pruneFinishedTransferHistory();
 			touchTransferItems(true);
+			finalizeUploadSessionIfIdle();
 			return;
 		}
 
@@ -1852,6 +2301,23 @@
 		viewerOpen = false;
 	}
 
+	function openPreviewFileActionDialog() {
+		if (!activeFile) {
+			return;
+		}
+
+		const previewFile =
+			filteredSortedFiles.find((file) => file.name === activeFile?.name && file.href === activeFile?.href) ??
+			data.inventory.files.find((file) => file.name === activeFile?.name && file.href === activeFile?.href) ??
+			null;
+		if (!previewFile) {
+			return;
+		}
+
+		closeFileViewer();
+		openFileActionDialogForFile(previewFile);
+	}
+
 	function goToViewerSiblingFile(direction: -1 | 1) {
 		if (!activeFile || filteredSortedFiles.length === 0) {
 			return;
@@ -1948,6 +2414,8 @@
 		sortedFiles = [...data.inventory.files].sort((a, b) => compareFiles(a, b, key, direction));
 	}
 	$: normalizedInventorySearchQuery = inventorySearchQuery.trim().toLowerCase();
+	$: navigationParentPath = getNavigationParentPath();
+	$: navigationBreadcrumbs = buildNavigationBreadcrumbs(data.inventory.currentPath);
 	$: filteredDirectories = normalizedInventorySearchQuery
 		? data.inventory.directories.filter((folder) =>
 				folder.name.toLowerCase().includes(normalizedInventorySearchQuery)
@@ -2023,6 +2491,8 @@
 
 </script>
 
+<svelte:window on:keydown={onGlobalKeydown} />
+
 <div class="app-shell">
 	<div class="two-col">
 		<aside>
@@ -2030,9 +2500,64 @@
 			<!-- SIDEBAR: BRAND -->
 			<!-- ======================================================================= -->
 			<div class="sidebar-top">
-				<h1 class="brand-title">Titan&apos;s Pit</h1>
+				<a
+					class="brand-title brand-title-link"
+					href={toPathHref('/')}
+					on:pointerenter={playHoverSfx}
+					on:focus={playHoverSfx}
+					on:click={playFolderClickSfx}
+				>
+					Titan&apos;s Pit
+				</a>
+				<div class="inventory-nav-strip inventory-nav-strip--sidebar">
+					<div class="inventory-nav-actions">
+						{#if data.inventory.isTrashView}
+							<a
+								class="inventory-nav-btn"
+								class:active={normalizeInventoryPath(data.inventory.currentPath) === normalizeInventoryPath(data.inventory.trashPath)}
+								href={toPathHref(data.inventory.trashPath)}
+								on:pointerenter={playHoverSfx}
+								on:focus={playHoverSfx}
+								on:click={playFolderClickSfx}
+							>
+								Trash Root
+							</a>
+						{/if}
+						{#if navigationParentPath}
+							<a
+								class="inventory-nav-btn"
+								href={toPathHref(navigationParentPath)}
+								on:pointerenter={playHoverSfx}
+								on:focus={playHoverSfx}
+								on:click={playFolderClickSfx}
+							>
+								Up
+							</a>
+						{/if}
+					</div>
+					<nav class="inventory-breadcrumbs" aria-label="Current path">
+						{#each navigationBreadcrumbs as crumb}
+							{#if crumb.current}
+								<span class="inventory-breadcrumb-current" aria-current="page">{crumb.label}</span>
+							{:else}
+								<a
+									class="inventory-breadcrumb-link"
+									href={toPathHref(crumb.path)}
+									on:pointerenter={playHoverSfx}
+									on:focus={playHoverSfx}
+									on:click={playFolderClickSfx}
+								>
+									{crumb.label}
+								</a>
+								<span class="inventory-breadcrumb-separator" aria-hidden="true">/</span>
+							{/if}
+						{/each}
+					</nav>
+				</div>
 				<p class="brand-line">Atlas Academy's central vault.</p>
-				<p class="brand-line">Path: {data.inventory.currentPath}</p>
+				<p class="brand-line">
+					Path: {data.inventory.isTrashView ? `Trash ${trashDisplayLabel()}` : data.inventory.currentPath}
+				</p>
 				<p class="brand-line">
 					Dirs: {data.inventory.directories.length} / Files: {data.inventory.files.length}
 				</p>
@@ -2074,8 +2599,9 @@
 					</button>
 				</div>
 				<div class="sidebar-search">
-					<label class="sidebar-search-label" for="inventory-sidebar-search">Search</label>
+					<label class="sidebar-search-label" for="inventory-sidebar-search">Search (/)</label>
 					<input
+						bind:this={inventorySearchInput}
 						id="inventory-sidebar-search"
 						class="sidebar-search-input"
 						type="search"
@@ -2092,7 +2618,11 @@
 			<div class="sidebar-bottom-panel">
 				{#if activeSidebarTab === 'inventions'}
 					<p class="brand-line">Sort and preview your inventory.</p>
-					<p class="brand-line">Click once to select, click again to open preview.</p>
+					<p class="brand-line">
+						{data.inventory.isTrashView
+							? 'Trash keeps deleted items until you restore or permanently remove them.'
+							: 'Click once to select, click again to open preview.'}
+					</p>
 					<div class="file-selection-tools sidebar-file-selection-tools">
 						<span class="file-selection-count">{selectedFileCount} selected</span>
 						<div class="sidebar-file-selection-actions">
@@ -2101,7 +2631,10 @@
 								class="file-selection-btn"
 								on:pointerenter={playHoverSfx}
 								on:focus={playHoverSfx}
-								on:click={toggleSelectAllFiles}
+								on:click={() => {
+									playMenuItemSfx();
+									toggleSelectAllFiles();
+								}}
 								disabled={data.inventory.files.length === 0 || isInventoryBusy()}
 							>
 								{allFilesSelected ? 'Unselect all' : 'Select all'}
@@ -2111,11 +2644,26 @@
 								class="file-selection-btn"
 								on:pointerenter={playHoverSfx}
 								on:focus={playHoverSfx}
-								on:click={clearSelectedFiles}
+								on:click={() => {
+									playMenuItemSfx();
+									clearSelectedFiles();
+								}}
 								disabled={selectedFileCount === 0 || isInventoryBusy()}
 							>
 								Clear
 							</button>
+							{#if data.inventory.isTrashView && selectedFileCount > 0}
+								<button
+									type="button"
+									class="file-selection-btn"
+									on:pointerenter={playHoverSfx}
+									on:focus={playHoverSfx}
+									on:click={onRestoreSelectedFiles}
+									disabled={isInventoryBusy()}
+								>
+									{moveFilesBusy ? 'Restoring...' : 'Restore all'}
+								</button>
+							{/if}
 							{#if selectedFileCount > 0}
 								<button
 									type="button"
@@ -2125,26 +2673,65 @@
 									on:click={onDeleteSelectedFiles}
 									disabled={isInventoryBusy()}
 								>
-									{deleteFilesBusy ? 'Deleting...' : 'Delete all'}
+									{deleteFilesBusy
+										? data.inventory.isTrashView
+											? 'Deleting...'
+											: 'Trashing...'
+										: data.inventory.isTrashView
+											? 'Delete all'
+											: 'Trash all'}
 								</button>
 							{/if}
 						</div>
 					</div>
 				{:else}
 					<p class="brand-line">Forge uploads into the active path.</p>
-					<p class="brand-line">Target: {data.inventory.currentPath}</p>
+					<p class="brand-line">
+						Target: {data.inventory.isTrashView ? `Trash ${trashDisplayLabel()}` : data.inventory.currentPath}
+					</p>
 					<p class="brand-line">Active transfers: {activeTransferCount}</p>
 				{/if}
 			</div>
+			<a
+				class="sidebar-trash-card"
+				class:active={data.inventory.isTrashView}
+				href={toPathHref(data.inventory.trashPath)}
+				on:pointerenter={playHoverSfx}
+				on:focus={playHoverSfx}
+				on:click={playFolderClickSfx}
+			>
+				<span class="sidebar-trash-icon" aria-hidden="true">🗑</span>
+				<span class="sidebar-trash-copy">
+					<strong>Trash</strong>
+					<small>{data.inventory.isTrashView ? `Viewing ${trashDisplayLabel()}` : 'Open deleted items'}</small>
+				</span>
+			</a>
 		</aside>
 
 		<main>
 			{#if activeSidebarTab === 'inventions'}
 				<div class="main-content" class:folders-expanded={foldersPanelExpanded}>
+					{#if data.inventory.isTrashView}
+						<div class="trash-banner">
+							<div>
+								<strong>Trash Can Active</strong>
+								<span>Browsing {trashDisplayLabel()}. Delete actions are permanent here.</span>
+							</div>
+							<a
+								class="trash-banner-link"
+								href={toPathHref('/')}
+								on:pointerenter={playHoverSfx}
+								on:focus={playHoverSfx}
+								on:click={playFolderClickSfx}
+							>
+								Return to Vault
+							</a>
+						</div>
+					{/if}
 					<!-- ======================================================================= -->
 					<!-- MAIN: FOLDERS -->
 					<!-- ======================================================================= -->
-					<div class="folder-div">
+					<div class="folder-div" use:panelBackgroundExpand={'folders'}>
 						<div class="section-head">
 							<div class="section-title-row">
 								<div class="section-title">Folders</div>
@@ -2239,13 +2826,21 @@
 										<button
 											type="button"
 											class="folder-delete-btn"
+											class:restore-mode={data.inventory.isTrashView}
 											on:pointerenter={playHoverSfx}
 											on:focus={playHoverSfx}
-											on:click={(event) => onDeleteFolder(event, folder.nextPath, folder.name)}
+											on:click={(event) =>
+												data.inventory.isTrashView
+													? onRestoreFolder(event, folder.nextPath, folder.name)
+													: onDeleteFolder(event, folder.nextPath, folder.name)}
 											disabled={isInventoryBusy() || folder.nextPath === null}
-											aria-label={`Delete folder ${folder.name}`}
+											aria-label={`${data.inventory.isTrashView ? 'Restore' : 'Trash'} folder ${folder.name}`}
 										>
-											{folderDeleteBusyPath === folder.nextPath ? '...' : 'Del'}
+											{folderDeleteBusyPath === folder.nextPath
+												? '...'
+												: data.inventory.isTrashView
+													? 'Restore'
+													: 'Trash'}
 										</button>
 									</div>
 								{/each}
@@ -2256,7 +2851,7 @@
 					<!-- ======================================================================= -->
 					<!-- MAIN: FILES -->
 					<!-- ======================================================================= -->
-					<div class="file-div">
+					<div class="file-div" use:panelBackgroundExpand={'files'}>
 						<div class="section-head">
 							<div class="section-title-row">
 								<div class="section-title">Files</div>
@@ -2278,12 +2873,12 @@
 								<button
 									type="button"
 									class:active={fileViewMode === 'list'}
-									on:click={() => (fileViewMode = 'list')}
+									on:click={() => setFileViewMode('list')}
 								>List</button>
 								<button
 									type="button"
 									class:active={fileViewMode === 'grid'}
-									on:click={() => (fileViewMode = 'grid')}
+									on:click={() => setFileViewMode('grid')}
 								>Grid</button>
 							</div>
 						</div>
@@ -2671,6 +3266,7 @@
 		on:close={closeFileViewer}
 		on:previous={() => goToViewerSiblingFile(-1)}
 		on:next={() => goToViewerSiblingFile(1)}
+		on:menu={openPreviewFileActionDialog}
 	/>
 
 	<FileActionDialog
@@ -2679,6 +3275,9 @@
 		error={fileActionError}
 		playHoverSfx={playHoverSfx}
 		playMenuItemSfx={playMenuItemSfx}
+		deleteLabel={deleteActionLabel()}
+		showRestore={data.inventory.isTrashView}
+		restoreLabel="Restore"
 		file={
 			fileActionFile
 				? {
@@ -2703,6 +3302,7 @@
 		on:close={closeFileActionDialog}
 		on:rename={onRenameFile}
 		on:delete={onDeleteFile}
+		on:restore={onRestoreFile}
 	/>
 
 	<UploadConflictDialog
@@ -2713,6 +3313,13 @@
 		playMenuItemSfx={playMenuItemSfx}
 		on:close={closeUploadConflictDialog}
 		on:resolve={onResolveUploadConflict}
+	/>
+
+	<UploadCompleteDialog
+		open={uploadCompleteOpen}
+		summary={uploadCompleteSummary}
+		playHoverSfx={playHoverSfx}
+		on:close={closeUploadCompleteDialog}
 	/>
 </div>
 
@@ -2832,11 +3439,26 @@
 
 	.brand-title {
 		margin: 0;
+		display: inline-flex;
+		align-items: center;
+		align-self: flex-start;
 		font-size: 1.15rem;
 		font-weight: 800;
 		line-height: 1.2;
 		letter-spacing: 0.08em;
 		text-transform: uppercase;
+	}
+
+	.brand-title-link {
+		color: inherit;
+		text-decoration: none;
+		transition: color 0.18s ease, text-shadow 0.18s ease;
+	}
+
+	.brand-title-link:hover,
+	.brand-title-link:focus-visible {
+		color: rgba(250, 238, 58, 0.96);
+		text-shadow: 0 0 12px rgba(250, 238, 58, 0.16);
 	}
 
 	.brand-line {
@@ -2937,6 +3559,61 @@
 		border-top: 1px solid var(--cc-panel-border-soft);
 	}
 
+	.sidebar-trash-card {
+		display: flex;
+		align-items: center;
+		gap: 0.65rem;
+		padding: 0.72rem 0.8rem;
+		border: 1px solid rgba(170, 178, 188, 0.46);
+		background: rgba(255, 255, 255, 0.04);
+		color: rgba(245, 248, 252, 0.94);
+		text-decoration: none;
+		transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+	}
+
+	.sidebar-trash-card:hover,
+	.sidebar-trash-card:focus-visible {
+		border-color: rgba(250, 238, 58, 0.74);
+		background: rgba(250, 238, 58, 0.14);
+		transform: translateY(-1px);
+	}
+
+	.sidebar-trash-card.active {
+		border-color: rgba(241, 129, 129, 0.82);
+		background: rgba(241, 129, 129, 0.18);
+		box-shadow: inset 0 0 0 1px rgba(241, 129, 129, 0.28);
+	}
+
+	.sidebar-trash-icon {
+		flex: 0 0 auto;
+		font-size: 1.05rem;
+		line-height: 1;
+	}
+
+	.sidebar-trash-copy {
+		display: grid;
+		gap: 0.14rem;
+		min-width: 0;
+	}
+
+	.sidebar-trash-copy strong,
+	.sidebar-trash-copy small {
+		display: block;
+	}
+
+	.sidebar-trash-copy strong {
+		font-size: 0.68rem;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+	}
+
+	.sidebar-trash-copy small {
+		font-size: 0.58rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--cc-text-secondary);
+	}
+
 	main {
 		height: 100%;
 		min-height: 0;
@@ -2948,6 +3625,152 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.8rem;
+	}
+
+	.inventory-nav-strip {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.7rem 0.85rem;
+		min-width: 0;
+		padding: 0.3rem 0 0.2rem;
+		border-top: 1px solid var(--cc-panel-border-soft);
+		border-bottom: 1px solid var(--cc-panel-border-soft);
+	}
+
+	.inventory-nav-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.42rem;
+		flex: 0 0 auto;
+	}
+
+	.inventory-nav-btn {
+		height: 24px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0 0.5rem;
+		border: 1px solid rgba(160, 168, 180, 0.48);
+		background: rgba(255, 255, 255, 0.04);
+		color: rgba(245, 248, 255, 0.92);
+		font-size: 0.54rem;
+		font-weight: 700;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		text-decoration: none;
+		transition: border-color 0.18s ease, background 0.18s ease, color 0.18s ease;
+	}
+
+	.inventory-nav-btn:hover,
+	.inventory-nav-btn:focus-visible {
+		border-color: rgba(250, 238, 58, 0.78);
+		background: rgba(250, 238, 58, 0.16);
+		color: rgba(248, 250, 255, 0.98);
+	}
+
+	.inventory-nav-btn.active {
+		border-color: rgba(250, 238, 58, 0.86);
+		background: rgba(250, 238, 58, 0.22);
+		color: rgba(248, 250, 255, 0.98);
+	}
+
+	.inventory-breadcrumbs {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.28rem;
+		min-width: 0;
+		justify-content: flex-start;
+	}
+
+	.inventory-breadcrumb-link,
+	.inventory-breadcrumb-current {
+		max-width: 100%;
+		font-size: 0.56rem;
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+	}
+
+	.inventory-breadcrumb-link {
+		color: rgba(226, 232, 242, 0.84);
+		text-decoration: none;
+		transition: color 0.18s ease;
+	}
+
+	.inventory-breadcrumb-link:hover,
+	.inventory-breadcrumb-link:focus-visible {
+		color: rgba(250, 238, 58, 0.94);
+	}
+
+	.inventory-breadcrumb-current {
+		color: rgba(248, 250, 255, 0.98);
+		font-weight: 700;
+	}
+
+	.inventory-breadcrumb-separator {
+		color: rgba(160, 168, 180, 0.72);
+		font-size: 0.54rem;
+		letter-spacing: 0.08em;
+	}
+
+	.trash-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.8rem;
+		padding: 0.6rem 0.8rem;
+		border: 1px solid rgba(241, 129, 129, 0.72);
+		background: linear-gradient(135deg, rgba(241, 129, 129, 0.16) 0%, rgba(255, 255, 255, 0.04) 100%);
+	}
+
+	.trash-banner > div {
+		display: grid;
+		gap: 0.18rem;
+		min-width: 0;
+	}
+
+	.trash-banner strong,
+	.trash-banner span {
+		display: block;
+	}
+
+	.trash-banner strong {
+		font-size: 0.68rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+	}
+
+	.trash-banner span {
+		font-size: 0.6rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: rgba(242, 235, 235, 0.88);
+	}
+
+	.trash-banner-link {
+		flex: 0 0 auto;
+		height: 30px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0 0.72rem;
+		border: 1px solid rgba(241, 129, 129, 0.78);
+		background: rgba(255, 255, 255, 0.08);
+		color: rgba(248, 241, 241, 0.96);
+		font-size: 0.58rem;
+		font-weight: 700;
+		letter-spacing: 0.11em;
+		text-transform: uppercase;
+		text-decoration: none;
+	}
+
+	.trash-banner-link:hover,
+	.trash-banner-link:focus-visible {
+		background: rgba(241, 129, 129, 0.24);
+		border-color: rgba(241, 129, 129, 0.94);
 	}
 
 	.main-content.folders-expanded .folder-div {
@@ -3147,7 +3970,7 @@
 	}
 
 	.folder-item-shell .folder-item {
-		padding-right: 3.4rem;
+		padding-right: 5.2rem;
 	}
 
 	.folder-delete-btn {
@@ -3167,10 +3990,22 @@
 		cursor: pointer;
 	}
 
+	.folder-delete-btn.restore-mode {
+		border-color: rgba(122, 219, 156, 0.72);
+		background: rgba(122, 219, 156, 0.18);
+		color: rgba(236, 249, 241, 0.96);
+	}
+
 	.folder-delete-btn:hover:enabled,
 	.folder-delete-btn:focus-visible:enabled {
 		border-color: rgba(241, 129, 129, 0.9);
 		background: rgba(241, 129, 129, 0.24);
+	}
+
+	.folder-delete-btn.restore-mode:hover:enabled,
+	.folder-delete-btn.restore-mode:focus-visible:enabled {
+		border-color: rgba(122, 219, 156, 0.9);
+		background: rgba(122, 219, 156, 0.26);
 	}
 
 	.folder-delete-btn:disabled {
@@ -4065,6 +4900,21 @@
 
 		.main-content {
 			min-height: 460px;
+		}
+
+		.trash-banner {
+			flex-direction: column;
+			align-items: flex-start;
+		}
+
+		.inventory-nav-strip {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+		.inventory-nav-actions,
+		.inventory-breadcrumbs {
+			justify-content: flex-start;
 		}
 
 		.forge-wrap {
